@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# pi-sandbox - run Pi in the compose sandbox (compose.yaml) on the current dir.
+#
+# Only glue for what compose cannot compute itself: host Pi version, the
+# OpenRouter credential, the default model, and your UID/GID.
+#
+#   pi-sandbox [pi args]    # Pi on $PWD (anything else goes to pi)
+#   pi-sandbox --ro ...     # workspace mounted read-only
+#   pi-sandbox --shell      # bash instead of Pi
+#   pi-sandbox --rebuild    # rebuild images first
+#   pi-sandbox --down       # stop the browser service
+set -euo pipefail
+
+die() { printf 'pi-sandbox: %s\n' "$*" >&2; exit 1; }
+here=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+agent_dir=${PI_HOST_AGENT_DIR:-$HOME/.pi/agent}
+compose=(docker compose --project-directory "$here" -f "$here/compose.yaml")
+run_opts=()
+
+while [ $# -gt 0 ]; do
+	case $1 in
+	--ro) export PI_WORKSPACE_MODE=ro ;;
+	--shell) run_opts+=(-e PI_SANDBOX_SHELL=1) ;;
+	--rebuild) run_opts+=(--build) ;;
+	--down) exec "${compose[@]}" down ;;
+	--) shift; break ;;
+	*) break ;;
+	esac
+	shift
+done
+
+export PI_WORKSPACE=$PWD PI_UID=$(id -u) PI_GID=$(id -g)
+export PI_SANDBOX_STATE=${PI_SANDBOX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/pi-sandbox/agent}
+(umask 077 && mkdir -p "$PI_SANDBOX_STATE")
+export PI_VERSION=${PI_VERSION:-$(tr -d '[:space:]' <"$agent_dir/install/current-version" 2>/dev/null)}
+[ -n "$PI_VERSION" ] || die "cannot determine the host Pi version; set PI_VERSION"
+
+spec=$(jq -r '.dependencies["pi-web-access"] // empty' "$agent_dir/npm/package.json" 2>/dev/null || true)
+export PI_WEB_PACKAGE=${PI_WEB_PACKAGE:-pi-web-access${spec:+@$spec}}
+
+# Mirror the host default model unless PI_SANDBOX_MODEL is set (even empty).
+if [ -z "${PI_SANDBOX_MODEL+x}" ]; then
+	PI_SANDBOX_MODEL=$(jq -r '(.defaultProvider // "") as $p | (.defaultModel // "")
+		| if . == "" or contains("/") or $p == "" then . else "\($p)/\(.)" end' \
+		"$agent_dir/settings.json" 2>/dev/null || true)
+fi
+export PI_SANDBOX_MODEL
+
+# Credential: Pi resolves (and refreshes) it; then auth.json; then the env.
+key=$(pi auth print-bearer-token --provider openrouter 2>/dev/null | head -n1 | tr -d '\r\n' || true)
+[ -n "$key" ] || key=$(jq -r '.openrouter | .access // .key // .apiKey // empty' "$agent_dir/auth.json" 2>/dev/null || true)
+[ -n "$key" ] || key=${OPENROUTER_API_KEY:-}
+[ -n "$key" ] || die "no OpenRouter credential: run 'pi auth login --provider openrouter' or set OPENROUTER_API_KEY"
+# Handed to compose as a file secret kept in RAM ($XDG_RUNTIME_DIR), mode 0600:
+# never an env var, argument, or image layer. Rewritten on every run.
+secret_dir=${XDG_RUNTIME_DIR:-/dev/shm}/pi-sandbox
+(umask 077 && mkdir -p "$secret_dir" && printf '%s' "$key" >"$secret_dir/openrouter")
+unset key OPENROUTER_API_KEY
+export PI_SANDBOX_KEY_FILE=$secret_dir/openrouter
+
+tty=()
+[ -t 0 ] && [ -t 1 ] || tty=(-T)
+exec "${compose[@]}" run --rm "${tty[@]}" "${run_opts[@]}" agent "$@"

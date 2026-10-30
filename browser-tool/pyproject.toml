@@ -1,0 +1,21 @@
+[project]
+name = "browser-mcp"
+version = "0.1.0"
+description = "MCP server driving a local headless Firefox through geckodriver"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.20",
+    "selenium>=4.36",
+    "markdownify>=1.2",
+    "pillow>=11",
+]
+
+[project.scripts]
+browser-mcp = "browser_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["browser_mcp"]

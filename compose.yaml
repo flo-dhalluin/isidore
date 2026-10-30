@@ -1,0 +1,78 @@
+# Pi coding agent + headless Firefox MCP server, each in a locked-down container.
+#
+#   ./pi-sandbox [pi args]      # launcher: fills in the host-derived variables below
+#
+# Or by hand, from the directory to expose (state dir must exist):
+#   PI_SANDBOX_KEY_FILE=~/.openrouter-key \
+#     docker compose -f /path/to/compose.yaml run --rm agent
+name: pi-sandbox
+
+x-hardening: &hardening
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+
+services:
+  agent:
+    <<: *hardening
+    build:
+      context: agent
+      args:
+        PI_VERSION: ${PI_VERSION:-latest}
+        PI_WEB_PACKAGE: ${PI_WEB_PACKAGE:-pi-web-access}
+    image: pi-sandbox-agent:${PI_VERSION:-latest}
+    hostname: pi-sandbox
+    user: ${PI_UID:-1000}:${PI_GID:-1000}
+    stdin_open: true
+    tty: true
+    pids_limit: ${PI_SANDBOX_PIDS:-512}
+    mem_limit: ${PI_SANDBOX_MEMORY:-4g}
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,mode=1777,size=${PI_SANDBOX_TMP_SIZE:-2g}
+    # The workspace keeps its host path, so Pi sessions in the shared state
+    # dir stay separated per project. The state dir must exist (owned by you).
+    working_dir: ${PI_WORKSPACE:-${PWD}}
+    volumes:
+      - ${PI_WORKSPACE:-${PWD}}:${PI_WORKSPACE:-${PWD}}:${PI_WORKSPACE_MODE:-rw}
+      - ${PI_SANDBOX_STATE:-${XDG_STATE_HOME:-${HOME}/.local/state}/pi-sandbox/agent}:/state
+    secrets: [openrouter]
+    environment:
+      PI_SANDBOX_MODEL: ${PI_SANDBOX_MODEL:-}
+      PI_SANDBOX_BROWSER_URL: http://browser:8931/mcp
+      # Docker injects ~/.docker/config.json proxies; keep MCP traffic direct.
+      NO_PROXY: ${NO_PROXY:-127.0.0.0/8,localhost},browser
+      no_proxy: ${NO_PROXY:-127.0.0.0/8,localhost},browser
+      GIT_AUTHOR_NAME: ${GIT_AUTHOR_NAME:-pi-sandbox}
+      GIT_AUTHOR_EMAIL: ${GIT_AUTHOR_EMAIL:-pi-sandbox@localhost}
+      TERM: ${TERM:-xterm-256color}
+      COLORTERM: ${COLORTERM:-}
+      LANG: ${LANG:-C.UTF-8}
+      TZ: ${TZ:-}
+    depends_on:
+      browser:
+        condition: service_healthy
+
+  browser:
+    <<: *hardening
+    build: browser-tool
+    image: pi-sandbox-browser
+    shm_size: 1g
+    pids_limit: 1024
+    mem_limit: ${BROWSER_MCP_MEMORY:-3g}
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,mode=1777,size=2g
+    environment:
+      BROWSER_MCP_ALLOW_JS: ${BROWSER_MCP_ALLOW_JS:-0}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 8931), 1)"]
+      interval: 10s
+      start_period: 10s
+      start_interval: 0.5s
+    restart: unless-stopped
+
+secrets:
+  # A file, bind-mounted read-only at /run/secrets/openrouter (environment
+  # secrets need a writable rootfs).
+  openrouter:
+    file: ${PI_SANDBOX_KEY_FILE:-/dev/null}
