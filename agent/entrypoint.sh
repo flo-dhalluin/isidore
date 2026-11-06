@@ -1,6 +1,6 @@
 #!/bin/sh
 # Container entrypoint: unlock the credential, seed the config dir, wire the
-# browser MCP server, run Pi (or bash with PI_SANDBOX_SHELL=1).
+# browser + scheduler MCP servers, run Pi (or bash with PI_SANDBOX_SHELL=1).
 set -eu
 
 export HOME="${HOME:-/tmp/home}"
@@ -25,17 +25,32 @@ if [ "$seed_tag" != "$(cat "$PI_CODING_AGENT_DIR/.seed" 2>/dev/null || true)" ];
 	pi update --models >/dev/null 2>&1 || true
 fi
 
-# MCP entry for the browser service. The state dir is persistent, so the
-# entry is removed again when the URL is unset.
+# MCP entries for the browser and scheduler services. The state dir is
+# persistent, so an entry is removed again when its URL is unset.
 mcp_file="$PI_CODING_AGENT_DIR/mcp.json"
+[ -s "$mcp_file" ] || printf '{}\n' >"$mcp_file"
 if [ -n "${PI_SANDBOX_BROWSER_URL:-}" ]; then
-	[ -s "$mcp_file" ] || printf '{}\n' >"$mcp_file"
 	jq --arg url "$PI_SANDBOX_BROWSER_URL" '.mcpServers.browser = {
 		url: $url, exposure: "direct", timeout: 120,
 		description: "Headless Firefox: open pages, read and interact with them, fill forms, take screenshots"
 	}' "$mcp_file" >"$mcp_file.tmp" && mv "$mcp_file.tmp" "$mcp_file"
-elif [ -s "$mcp_file" ] && jq -e '.mcpServers.browser' "$mcp_file" >/dev/null 2>&1; then
+elif jq -e '.mcpServers.browser' "$mcp_file" >/dev/null 2>&1; then
 	jq 'del(.mcpServers.browser)' "$mcp_file" >"$mcp_file.tmp" && mv "$mcp_file.tmp" "$mcp_file"
+fi
+if [ -n "${PI_SANDBOX_SCHEDULER_URL:-}" ]; then
+	if [ -n "${SCHEDULER_TOKEN:-}" ]; then
+		jq --arg url "$PI_SANDBOX_SCHEDULER_URL" --arg token "$SCHEDULER_TOKEN" '.mcpServers.scheduler = {
+			url: $url, headers: {Authorization: ("Bearer " + $token)}, exposure: "direct", timeout: 30,
+			description: "Schedule one-shot or recurring tasks that spawn isolated Pi agents"
+		}' "$mcp_file" >"$mcp_file.tmp" && mv "$mcp_file.tmp" "$mcp_file"
+	else
+		jq --arg url "$PI_SANDBOX_SCHEDULER_URL" '.mcpServers.scheduler = {
+			url: $url, exposure: "direct", timeout: 30,
+			description: "Schedule one-shot or recurring tasks that spawn isolated Pi agents"
+		}' "$mcp_file" >"$mcp_file.tmp" && mv "$mcp_file.tmp" "$mcp_file"
+	fi
+elif jq -e '.mcpServers.scheduler' "$mcp_file" >/dev/null 2>&1; then
+	jq 'del(.mcpServers.scheduler)' "$mcp_file" >"$mcp_file.tmp" && mv "$mcp_file.tmp" "$mcp_file"
 fi
 
 # A usable git identity, without touching the host configuration.

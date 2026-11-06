@@ -8,7 +8,9 @@ launcher that fills in what compose can't compute from the host.
 ```
 agent/          Pi image + entrypoint
 browser-tool/   Firefox + geckodriver + browser-mcp server
-compose.yaml    both services, hardening, secret, wiring
+isidore/        web UI + Telegram bot that spawns isolated Pi tasks
+scheduler/      MCP tool server for one-shot / recurring tasks
+compose.yaml    all services, hardening, secret, wiring
 pi-sandbox      launcher
 ```
 
@@ -18,7 +20,8 @@ pi-sandbox -p "summarize this"  # one-shot (any other args go to pi)
 pi-sandbox --ro                 # workspace mounted read-only
 pi-sandbox --shell              # bash in the agent container
 pi-sandbox --rebuild            # rebuild images (e.g. after `pi update --extensions`)
-pi-sandbox --down               # stop the browser service
+pi-sandbox --serve              # start isidore + scheduler + browser in the background
+pi-sandbox --down               # stop the services
 
 ln -s "$PWD/pi-sandbox" ~/.local/bin/pi-sandbox
 ```
@@ -62,6 +65,43 @@ container only: never in image layers, `docker inspect`, env of the compose
 process, or a command line. (Environment-sourced compose secrets are not usable
 with a read-only rootfs.)
 
+## isidore (spawn tasks remotely)
+
+`isidore` is a small web service that turns a prompt into a fresh, isolated
+`pi` process. Each task gets its own workspace and `$HOME` under
+`/state/workspaces/<id>`, runs with `--no-session`, and is killed as a whole
+process group on cancel or timeout. The UI is one minimalist HTML page at
+`http://127.0.0.1:8920/`; the same actions are available over a JSON API.
+
+```sh
+pi-sandbox --serve                 # start isidore, scheduler and browser
+open http://127.0.0.1:8920/        # or curl -X POST localhost:8920/api/tasks \
+                                   #   -H 'content-type: application/json' \
+                                   #   -d '{"prompt":"list the files here"}'
+```
+
+A Telegram bot is enabled by setting `ISIDORE_TELEGRAM_TOKEN` and
+`ISIDORE_TELEGRAM_CHATS` (comma-separated allow-list). It long-polls, so no
+public webhook is needed; plain text or `/new <prompt>` creates a task and the
+chat is notified when it finishes. See [isidore/README.md](isidore/README.md).
+
+## Scheduler (schedule tasks)
+
+`scheduler` is an MCP tool server (streamable HTTP at `/mcp`) plus a firing
+loop. Pi gets it through `mcp.json` automatically, so the agent can call
+`schedule_task`, `list_schedules`, `cancel_schedule` and `run_schedule_now`.
+A schedule is either one-shot (`at`, ISO-8601 or `+30m`) or recurring
+(`every`, e.g. `30m`, `2h`, `1d`). When due, the scheduler calls isidore's
+`POST /api/tasks`; schedules persist in `schedules.json` across restarts.
+
+```text
+schedule_task(prompt="check the build", every="1h")
+schedule_task(prompt="summarize the repo", at="2025-01-31T09:00:00Z")
+```
+
+isidore's web UI can also create schedules when `ISIDORE_SCHEDULER_URL` is
+set (compose does this). See [scheduler/README.md](scheduler/README.md).
+
 ## Browser
 
 The entrypoint adds `mcpServers.browser = {url: "http://browser:8931/mcp",
@@ -81,7 +121,10 @@ Smoke test: `docker compose exec -T browser python - < pilot.py`.
 ## Tuning
 
 `PI_SANDBOX_MEMORY` (4g), `PI_SANDBOX_PIDS` (512), `PI_SANDBOX_TMP_SIZE` (2g),
-`BROWSER_MCP_MEMORY` (3g), `PI_WORKSPACE_MODE` (`rw`/`ro`), `GIT_AUTHOR_NAME`,
+`BROWSER_MCP_MEMORY` (3g), `ISIDORE_MEMORY` (4g), `ISIDORE_MAX_WORKERS` (2),
+`ISIDORE_TASK_TIMEOUT` (none), `ISIDORE_TOKEN`, `ISIDORE_TELEGRAM_TOKEN`,
+`ISIDORE_TELEGRAM_CHATS`, `SCHEDULER_MEMORY` (256m), `SCHEDULER_TOKEN`,
+`SCHEDULER_TICK` (1), `PI_WORKSPACE_MODE` (`rw`/`ro`), `GIT_AUTHOR_NAME`,
 `GIT_AUTHOR_EMAIL`. Extra mounts or env: `docker compose run` flags in a
 `compose.override.yaml`.
 
