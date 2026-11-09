@@ -15,3 +15,6 @@ node_modules/
 
 # Test helpers (fake executables must live on an exec-capable mount)
 .isidore-test-bin-*
+
+# Local environment / secrets; see .env.example
+.env
