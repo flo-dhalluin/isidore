@@ -8,19 +8,22 @@ import os
 import shutil
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
+from starlette.templating import Jinja2Templates
 
 from .runner import PiRunner, which_pi
 from .scheduler_client import SchedulerClient, SchedulerError
 from .store import Task, TaskStore
 from .telegram import TelegramBot
-from .ui import INDEX_HTML, TASK_HTML
 
 log = logging.getLogger("isidore")
+
+templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 
 MAX_PROMPT = 100_000
 
@@ -91,14 +94,14 @@ def _deny() -> Response:
 async def index(request: Request) -> Response:
     if not _authorised(request):
         return PlainTextResponse("unauthorised", status_code=401)
-    return HTMLResponse(INDEX_HTML)
+    return templates.TemplateResponse(request, "index.html")
 
 
 async def task_page(request: Request) -> Response:
     """Full-screen conversation view; the data is fetched from the API."""
     if not _authorised(request):
         return PlainTextResponse("unauthorised", status_code=401)
-    return HTMLResponse(TASK_HTML)
+    return templates.TemplateResponse(request, "task.html")
 
 
 async def healthz(request: Request) -> Response:

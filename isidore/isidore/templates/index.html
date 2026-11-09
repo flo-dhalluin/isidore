@@ -1,0 +1,200 @@
+{% extends "base.html" %}
+{% block style %}
+  body { margin: 0 auto; max-width: 860px; padding: 2rem 1rem 4rem; background: var(--bg); color: var(--fg);
+         font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  h1 { font-size: 1.1rem; letter-spacing: .18em; text-transform: uppercase; margin: 0 0 .25rem; }
+  .sub { color: var(--muted); margin: 0 0 1.5rem; font-size: .85rem; }
+  form { border: 1px solid var(--line); padding: 1rem; margin-bottom: 1.5rem; }
+  textarea, input { width: 100%; background: transparent; color: inherit; border: 1px solid var(--line);
+                    padding: .55rem .6rem; font: inherit; }
+  textarea { min-height: 5.5rem; resize: vertical; }
+  .row { display: flex; gap: .6rem; flex-wrap: wrap; margin-top: .6rem; align-items: center; }
+  .row > * { flex: 1 1 10rem; }
+  button { background: var(--accent); color: #fff; border: 0; padding: .55rem .9rem; font: inherit;
+           cursor: pointer; flex: 0 0 auto; }
+  button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line); }
+  button:disabled { opacity: .5; cursor: default; }
+  .tasks { display: grid; gap: .6rem; }
+  .task { border: 1px solid var(--line); padding: .7rem .8rem; cursor: pointer; }
+  .task:hover { border-color: var(--accent); }
+  .task header { display: flex; gap: .6rem; align-items: baseline; flex-wrap: wrap; }
+  a.plain { color: inherit; text-decoration: none; }
+  .id { color: var(--muted); font-size: .8rem; }
+  .badge { color: var(--muted); font-size: .75rem; }
+  .status { font-size: .75rem; text-transform: uppercase; letter-spacing: .08em; }
+  .status.succeeded { color: #2f855a; } .status.failed, .status.timeout { color: #c53030; }
+  .status.running { color: var(--accent); } .status.cancelled { color: var(--muted); }
+  .prompt { margin: .35rem 0 0; white-space: pre-wrap; word-break: break-word; }
+  /* Keep the list concise: two lines per prompt, answer and error. */
+  .clamp { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
+  .task .md.preview { max-height: 3em; overflow: hidden; margin-top: .35rem; color: var(--muted); }
+  .task .md.preview * { margin: 0 !important; font-size: inherit !important; }
+  .task .md.preview :is(pre, table, img, hr) { display: none; }
+  pre.err.clamp { white-space: pre-wrap; }
+  pre { margin: .5rem 0 0; padding: .6rem; background: rgba(127,127,127,.08); overflow: auto;
+        max-height: 22rem; white-space: pre-wrap; word-break: break-word; font-size: .82rem; }
+  .empty { color: var(--muted); }
+  .err { color: #c53030; }
+  h2 { font-size: .85rem; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin: 0 0 .6rem; }
+  #schedules { margin-bottom: 1.5rem; }
+  .schedule { border: 1px solid var(--line); padding: .7rem .8rem; }
+  .schedule header { display: flex; gap: .6rem; align-items: baseline; flex-wrap: wrap; }
+  .meta { color: var(--muted); font-size: .8rem; margin: .35rem 0 0; }
+{% endblock %}
+{% block body %}
+<h1>isidore</h1>
+<p class="sub">spawn isolated Pi tasks &middot; <span id="count">0</span> total</p>
+
+<form id="run">
+  <textarea id="prompt" placeholder="What should the agent do?" required></textarea>
+  <div class="row">
+    <input id="model" placeholder="model (optional, e.g. openrouter/anthropic/claude-sonnet-4)">
+    <button type="submit">Run now</button>
+  </div>
+</form>
+
+<section id="schedules" hidden>
+  <h2>Scheduled</h2>
+  <div class="tasks" id="schedule-list"></div>
+</section>
+
+<div class="tasks" id="tasks"><p class="empty">Loading…</p></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const TOKEN = new URLSearchParams(location.search).get("token") || "";
+let scheduler = false;
+
+async function api(path, opts) {
+  const headers = {"Content-Type": "application/json"};
+  if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
+  const res = await fetch(path, Object.assign({headers}, opts));
+  if (!res.ok) throw new Error((await res.text()) || res.statusText);
+  return res.status === 204 ? null : res.json();
+}
+
+function openTask(id) {
+  location.href = "/tasks/" + encodeURIComponent(id) + (TOKEN ? "?token=" + encodeURIComponent(TOKEN) : "");
+}
+
+function render(tasks) {
+  $("count").textContent = tasks.length;
+  if (!tasks.length) { $("tasks").innerHTML = '<p class="empty">No tasks yet.</p>'; return; }
+  // One entry per conversation: a follow-up reuses its root task's thread id.
+  const threads = new Map();
+  for (const t of tasks) {
+    const root = t.thread_id || t.id;
+    if (!threads.has(root)) threads.set(root, []);
+    threads.get(root).push(t);
+  }
+  $("tasks").innerHTML = [...threads.entries()].map(([root, turns]) => {
+    // tasks arrive newest first, so turns[0] is the latest state of the thread.
+    const t = turns[0];
+    return `
+    <article class="task" data-open="${esc(root)}">
+      <header>
+        <span class="id">${esc(root)}</span>
+        <span class="status ${esc(t.status)}">${esc(t.status)}</span>
+        ${turns.length > 1 ? `<span class="badge">${turns.length} turns</span>` : ""}
+        ${t.exit_code !== null && t.exit_code !== undefined ? `<span class="id">exit ${esc(t.exit_code)}</span>` : ""}
+        ${t.done ? `<button class="ghost" data-delete="${esc(root)}">delete</button>` : `<button class="ghost" data-cancel="${esc(t.id)}">cancel</button>`}
+      </header>
+      <p class="prompt clamp">${esc(t.prompt)}</p>
+      ${t.output ? `<div class="md preview">${mdToHtml(t.output)}</div>` : ""}
+      ${t.error ? `<pre class="err clamp">${esc(t.error)}</pre>` : ""}
+    </article>`;
+  }).join("");
+  document.querySelectorAll("[data-open]").forEach((el) => {
+    el.onclick = () => openTask(el.dataset.open);
+  });
+  document.querySelectorAll("[data-cancel]").forEach((b) => {
+    b.onclick = async (ev) => { ev.stopPropagation(); b.disabled = true; try { await api("/api/tasks/" + b.dataset.cancel + "/cancel", {method: "POST"}); } catch (e) { alert(e.message); } refresh(); };
+  });
+  document.querySelectorAll("[data-delete]").forEach((b) => {
+    b.onclick = async (ev) => {
+      ev.stopPropagation();
+      if (!confirm("Delete this conversation and its workspace?")) return;
+      b.disabled = true;
+      try { await api("/api/tasks/" + b.dataset.delete, {method: "DELETE"}); } catch (e) { alert(e.message); }
+      refresh();
+    };
+  });
+}
+
+function fmtEvery(seconds) {
+  const s = Number(seconds);
+  if (!s) return esc(seconds);
+  for (const [unit, n] of [["d", 86400], ["h", 3600], ["m", 60]]) if (s % n === 0) return s / n + unit;
+  return s + "s";
+}
+
+function fmtTime(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return isNaN(d) ? esc(iso) : esc(d.toLocaleString());
+}
+
+function renderSchedules(items) {
+  const active = items.filter((s) => s.enabled);
+  if (!active.length) { $("schedule-list").innerHTML = '<p class="empty">No scheduled tasks.</p>'; return; }
+  $("schedule-list").innerHTML = active.map((s) => `
+    <article class="schedule">
+      <header>
+        <span class="id">${esc(s.id)}</span>
+        <span class="status">${esc(s.mode)}</span>
+        <button class="ghost" data-unschedule="${esc(s.id)}">cancel</button>
+      </header>
+      <p class="prompt clamp">${esc(s.prompt)}</p>
+      <p class="meta">${s.mode === "once" ? "at " + fmtTime(s.at) : "every " + fmtEvery(s.every)}
+        &middot; next ${fmtTime(s.next_run)} &middot; runs ${esc(s.runs)}
+        ${s.last_error ? `&middot; <span class="err">${esc(s.last_error)}</span>` : ""}</p>
+    </article>`).join("");
+  document.querySelectorAll("[data-unschedule]").forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm("Cancel this schedule?")) return;
+      b.disabled = true;
+      try { await api("/api/schedules/" + encodeURIComponent(b.dataset.unschedule), {method: "DELETE"}); } catch (e) { alert(e.message); }
+      refreshSchedules();
+    };
+  });
+}
+
+async function refreshSchedules() {
+  if (!scheduler) return;
+  try { renderSchedules((await api("/api/schedules")).schedules || []); }
+  catch (e) { $("schedule-list").innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+}
+
+async function refresh() {
+  refreshSchedules();
+  try { render(await api("/api/tasks?limit=50")); }
+  catch (e) { $("tasks").innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+}
+
+$("run").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const button = ev.submitter || ev.target.querySelector("button");
+  button.disabled = true;
+  try {
+    await api("/api/tasks", {method: "POST", body: JSON.stringify({prompt: $("prompt").value, model: $("model").value || null})});
+    $("prompt").value = "";
+    refresh();
+  } catch (e) { alert(e.message); }
+  finally { button.disabled = false; }
+};
+
+(async () => {
+  try {
+    scheduler = !!(await api("/api/info")).scheduler;
+    $("schedules").hidden = !scheduler;
+  } catch (e) { /* no scheduler info: keep the section hidden */ }
+  refresh();
+  setInterval(refresh, 3000);
+})();
+
+
+{% include "_markdown.js" %}
+
+</script>
+{% endblock %}

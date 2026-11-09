@@ -1,0 +1,171 @@
+{% extends "base.html" %}
+{% block title %}isidore · task{% endblock %}
+{% block style %}
+  body { margin: 0; height: 100dvh; display: flex; flex-direction: column; background: var(--bg); color: var(--fg);
+         font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  header.bar { display: flex; gap: .8rem; align-items: baseline; flex-wrap: wrap;
+               padding: .7rem 1rem; border-bottom: 1px solid var(--line); }
+  header.bar h1 { font-size: 1rem; letter-spacing: .18em; text-transform: uppercase; margin: 0; }
+  header.bar .spacer { flex: 1; }
+  .id { color: var(--muted); font-size: .8rem; }
+  .badge { color: var(--muted); font-size: .75rem; }
+  .status { font-size: .75rem; text-transform: uppercase; letter-spacing: .08em; }
+  .status.succeeded { color: #2f855a; } .status.failed, .status.timeout { color: #c53030; }
+  .status.running { color: var(--accent); } .status.cancelled, .status.queued { color: var(--muted); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  main { flex: 1; overflow: auto; }
+  .inner { max-width: 860px; margin: 0 auto; padding: 1.5rem 1rem 2rem; display: grid; gap: 1.2rem; }
+  .turn { border-top: 1px solid var(--line); padding-top: 1rem; }
+  .turn:first-child { border-top: 0; padding-top: 0; }
+  .who { color: var(--muted); font-size: .75rem; text-transform: uppercase; letter-spacing: .1em; }
+  .prompt { margin: .3rem 0 0; white-space: pre-wrap; word-break: break-word; }
+  .ask { background: rgba(127,127,127,.1); border-left: 3px solid var(--accent); padding: .6rem .8rem; }
+  .answer { margin-top: 1rem; padding-left: .8rem; border-left: 3px solid var(--line); }
+  .answer .md { margin-top: .4rem; }
+  pre { margin: .6rem 0 0; padding: .6rem; background: rgba(127,127,127,.08); overflow: auto;
+        white-space: pre-wrap; word-break: break-word; font-size: .85rem; }
+  .foot { display: flex; gap: .6rem; align-items: baseline; flex-wrap: wrap; margin-top: .5rem; }
+  .empty { color: var(--muted); }
+  .err { color: #c53030; }
+  form { border-top: 1px solid var(--line); padding: .8rem 1rem; }
+  .composer { max-width: 860px; margin: 0 auto; }
+  textarea { width: 100%; background: transparent; color: inherit; border: 1px solid var(--line);
+             padding: .55rem .6rem; font: inherit; min-height: 3.4rem; max-height: 12rem; resize: vertical; }
+  .row { display: flex; gap: .6rem; flex-wrap: wrap; margin-top: .6rem; align-items: center; }
+  .row .grow { flex: 1 1 12rem; }
+  button { background: var(--accent); color: #fff; border: 0; padding: .55rem .9rem; font: inherit; cursor: pointer; }
+  button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line); }
+  button.danger { background: transparent; color: #c53030; border: 1px solid var(--line); }
+  button:disabled { opacity: .5; cursor: default; }
+  .hint { color: var(--muted); font-size: .8rem; margin-top: .4rem; }
+{% endblock %}
+{% block body %}
+<header class="bar">
+  <h1>isidore</h1>
+  <a id="back" href="/">← tasks</a>
+  <span class="spacer"></span>
+  <span class="id" id="root"></span>
+  <span class="status" id="status"></span>
+  <button class="ghost" id="cancel" hidden>cancel</button>
+  <button class="danger" id="delete" hidden>delete</button>
+</header>
+
+<main><div class="inner" id="turns"><p class="empty">Loading…</p></div></main>
+
+<form id="ask">
+  <div class="composer">
+    <textarea id="prompt" placeholder="Follow-up question…" required></textarea>
+    <div class="row">
+      <input class="grow" id="model" placeholder="model override (optional)">
+      <button type="submit" id="send">Send</button>
+    </div>
+    <p class="hint" id="hint"></p>
+  </div>
+</form>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const TOKEN = new URLSearchParams(location.search).get("token") || "";
+const ROOT = decodeURIComponent(location.pathname.replace(/^\/tasks\//, "").replace(/\/+$/, ""));
+if (TOKEN) { $("back").href = "/?token=" + encodeURIComponent(TOKEN); }
+
+async function api(path, opts) {
+  const headers = {"Content-Type": "application/json"};
+  if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
+  const res = await fetch(path, Object.assign({headers}, opts));
+  if (!res.ok) throw new Error((await res.text()) || res.statusText);
+  return res.status === 204 ? null : res.json();
+}
+
+let lastSig = null;
+let lastTurns = 0;
+
+function turn(task) {
+  return `
+    <article class="turn">
+      <section class="ask">
+        <span class="who">you</span>
+        <p class="prompt">${esc(task.prompt)}</p>
+      </section>
+      ${task.output || task.error ? `<section class="answer">
+        <span class="who">agent</span>
+        ${task.output ? `<div class="md">${mdToHtml(task.output)}</div>` : ""}
+        ${task.error ? `<pre class="err">${esc(task.error)}</pre>` : ""}
+      </section>` : ""}
+      <div class="foot">
+        <span class="status ${esc(task.status)}">${esc(task.status)}</span>
+        <span class="badge">${esc(task.id)}</span>
+        ${task.exit_code !== null && task.exit_code !== undefined ? `<span class="badge">exit ${esc(task.exit_code)}</span>` : ""}
+      </div>
+    </article>`;
+}
+
+function render(data) {
+  $("root").textContent = data.id;
+  const last = data.turns[data.turns.length - 1];
+  $("status").textContent = last ? last.status : "";
+  $("status").className = "status " + (last ? last.status : "");
+  const running = data.running;
+  $("cancel").hidden = !running;
+  if (running && last) $("cancel").dataset.id = last.id;
+  $("delete").hidden = running || !data.turns.length;
+  $("send").disabled = running;
+  $("hint").textContent = running ? "waiting for the current turn to finish…" : "answers keep this conversation's workspace and session";
+  // Re-render only when something changed, so reading/scrolling is not disturbed.
+  const sig = data.turns.map((t) => [t.id, t.status, t.output.length, t.error || ""].join(":")).join("|");
+  if (sig === lastSig) return;
+  const main = document.querySelector("main");
+  const atBottom = main.scrollHeight - main.scrollTop - main.clientHeight < 80;
+  $("turns").innerHTML = data.turns.map(turn).join("");
+  if (data.turns.length !== lastTurns || atBottom || running) main.scrollTop = main.scrollHeight;
+  lastSig = sig;
+  lastTurns = data.turns.length;
+}
+
+async function refresh() {
+  try { render(await api("/api/tasks/" + encodeURIComponent(ROOT) + "/thread")); }
+  catch (e) { $("turns").innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+}
+
+$("ask").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const text = $("prompt").value.trim();
+  if (!text) return;
+  const data = await api("/api/tasks/" + encodeURIComponent(ROOT) + "/thread");
+  const last = data.turns[data.turns.length - 1];
+  if (!last || data.running) return;
+  $("send").disabled = true;
+  try {
+    await api("/api/tasks/" + encodeURIComponent(last.id) + "/followup",
+      {method: "POST", body: JSON.stringify({prompt: text, model: $("model").value || null})});
+    $("prompt").value = "";
+    refresh();
+  } catch (e) { alert(e.message); }
+  finally { $("send").disabled = false; }
+};
+
+$("cancel").onclick = async () => {
+  const id = $("cancel").dataset.id;
+  if (!id) return;
+  try { await api("/api/tasks/" + encodeURIComponent(id) + "/cancel", {method: "POST"}); } catch (e) { alert(e.message); }
+  refresh();
+};
+
+$("delete").onclick = async () => {
+  if (!confirm("Delete this conversation and its workspace?")) return;
+  try {
+    await api("/api/tasks/" + encodeURIComponent(ROOT), {method: "DELETE"});
+    location.href = "/" + (TOKEN ? "?token=" + encodeURIComponent(TOKEN) : "");
+  } catch (e) { alert(e.message); }
+};
+
+refresh();
+setInterval(refresh, 2000);
+
+
+{% include "_markdown.js" %}
+
+</script>
+{% endblock %}

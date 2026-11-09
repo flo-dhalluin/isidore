@@ -1,0 +1,22 @@
+<!doctype html>
+{#- Shared page shell: theme variables, Markdown styles and the page blocks.
+    Pages carry no server-side data; everything is fetched from the JSON API. #}
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}isidore{% endblock %}</title>
+<style>
+  :root { color-scheme: light dark; --fg:#1b1b1b; --muted:#777; --line:#d8d8d8; --bg:#fff; --accent:#2b6cb0; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e8e8e8; --muted:#999; --line:#333; --bg:#111; --accent:#7aa7d8; }
+  }
+  * { box-sizing: border-box; }
+{% block style %}{% endblock %}
+{% include "_markdown.css" %}
+</style>
+</head>
+<body>
+{% block body %}{% endblock %}
+</body>
+</html>

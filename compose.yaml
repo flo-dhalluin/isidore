@@ -40,9 +40,11 @@ services:
     environment:
       PI_SANDBOX_MODEL: ${PI_SANDBOX_MODEL:-}
       PI_SANDBOX_BROWSER_URL: http://browser:8931/mcp
+      PI_SANDBOX_SCHEDULER_URL: http://scheduler:8940/mcp
+      SCHEDULER_TOKEN: ${SCHEDULER_TOKEN:-}
       # Docker injects ~/.docker/config.json proxies; keep MCP traffic direct.
-      NO_PROXY: ${NO_PROXY:-127.0.0.0/8,localhost},browser
-      no_proxy: ${NO_PROXY:-127.0.0.0/8,localhost},browser
+      NO_PROXY: ${NO_PROXY:-127.0.0.0/8,localhost},browser,scheduler,isidore
+      no_proxy: ${NO_PROXY:-127.0.0.0/8,localhost},browser,scheduler,isidore
       GIT_AUTHOR_NAME: ${GIT_AUTHOR_NAME:-pi-sandbox}
       GIT_AUTHOR_EMAIL: ${GIT_AUTHOR_EMAIL:-pi-sandbox@localhost}
       TERM: ${TERM:-xterm-256color}
@@ -52,6 +54,10 @@ services:
     depends_on:
       browser:
         condition: service_healthy
+      scheduler:
+        condition: service_started
+      isidore:
+        condition: service_started
 
   browser:
     <<: *hardening
@@ -68,6 +74,88 @@ services:
       test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 8931), 1)"]
       interval: 10s
       start_period: 10s
+      start_interval: 0.5s
+    restart: unless-stopped
+
+  # isidore: spawn isolated Pi tasks from a web UI or Telegram. Each task is
+  # its own `pi` process in its own workspace under /state/workspaces.
+  isidore:
+    <<: *hardening
+    build:
+      context: isidore
+      args:
+        PI_VERSION: ${PI_VERSION:-latest}
+        PI_WEB_PACKAGE: ${PI_WEB_PACKAGE:-pi-web-access}
+    image: pi-sandbox-isidore:${PI_VERSION:-latest}
+    hostname: isidore
+    user: ${PI_UID:-1000}:${PI_GID:-1000}
+    pids_limit: ${PI_SANDBOX_PIDS:-512}
+    mem_limit: ${ISIDORE_MEMORY:-4g}
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,mode=1777,size=${PI_SANDBOX_TMP_SIZE:-2g}
+    # Bound to loopback: put a reverse proxy in front for remote access.
+    ports:
+      - "127.0.0.1:${ISIDORE_PORT:-8920}:8920"
+    volumes:
+      - ${ISIDORE_STATE:-${XDG_STATE_HOME:-${HOME}/.local/state}/pi-sandbox/isidore}:/state
+    secrets: [openrouter]
+    environment:
+      ISIDORE_STATE: /state
+      ISIDORE_HOST: 0.0.0.0
+      ISIDORE_PORT: "8920"
+      ISIDORE_MODEL: ${PI_SANDBOX_MODEL:-}
+      ISIDORE_MAX_WORKERS: ${ISIDORE_MAX_WORKERS:-2}
+      ISIDORE_TASK_TIMEOUT: ${ISIDORE_TASK_TIMEOUT:-}
+      ISIDORE_TOKEN: ${ISIDORE_TOKEN:-}
+      ISIDORE_SCHEDULER_URL: http://scheduler:8940
+      ISIDORE_SCHEDULER_TOKEN: ${SCHEDULER_TOKEN:-}
+      ISIDORE_TELEGRAM_TOKEN: ${ISIDORE_TELEGRAM_TOKEN:-}
+      ISIDORE_TELEGRAM_CHATS: ${ISIDORE_TELEGRAM_CHATS:-}
+      PI_SANDBOX_BROWSER_URL: http://browser:8931/mcp
+      PI_SANDBOX_SCHEDULER_URL: http://scheduler:8940/mcp
+      NO_PROXY: ${NO_PROXY:-127.0.0.0/8,localhost},browser,scheduler,isidore
+      no_proxy: ${NO_PROXY:-127.0.0.0/8,localhost},browser,scheduler,isidore
+      GIT_AUTHOR_NAME: ${GIT_AUTHOR_NAME:-pi-sandbox}
+      GIT_AUTHOR_EMAIL: ${GIT_AUTHOR_EMAIL:-pi-sandbox@localhost}
+      LANG: ${LANG:-C.UTF-8}
+      TZ: ${TZ:-}
+    depends_on:
+      browser:
+        condition: service_healthy
+      scheduler:
+        condition: service_started
+    restart: unless-stopped
+
+  # scheduler: MCP tool server + REST API + firing loop. Calls isidore to
+  # spawn tasks; state (schedules.json) lives in /state.
+  scheduler:
+    <<: *hardening
+    build: scheduler
+    image: pi-sandbox-scheduler
+    hostname: scheduler
+    user: ${PI_UID:-1000}:${PI_GID:-1000}
+    pids_limit: 128
+    mem_limit: ${SCHEDULER_MEMORY:-256m}
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,mode=1777,size=64m
+    volumes:
+      - ${SCHEDULER_STATE:-${XDG_STATE_HOME:-${HOME}/.local/state}/pi-sandbox/scheduler}:/state
+    environment:
+      SCHEDULER_STATE: /state
+      SCHEDULER_HOST: 0.0.0.0
+      SCHEDULER_PORT: "8940"
+      SCHEDULER_ISIDORE_URL: http://isidore:8920
+      SCHEDULER_ISIDORE_TOKEN: ${ISIDORE_TOKEN:-}
+      SCHEDULER_TOKEN: ${SCHEDULER_TOKEN:-}
+      SCHEDULER_TICK: ${SCHEDULER_TICK:-1}
+      SCHEDULER_RETRY_DELAY: ${SCHEDULER_RETRY_DELAY:-30}
+      NO_PROXY: ${NO_PROXY:-127.0.0.0/8,localhost},browser,scheduler,isidore
+      no_proxy: ${NO_PROXY:-127.0.0.0/8,localhost},browser,scheduler,isidore
+      TZ: ${TZ:-}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 8940), 1)"]
+      interval: 10s
+      start_period: 5s
       start_interval: 0.5s
     restart: unless-stopped
 
