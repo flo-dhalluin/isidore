@@ -77,8 +77,8 @@ services:
       start_interval: 0.5s
     restart: unless-stopped
 
-  # isidore: spawn isolated Pi tasks from a web UI or Telegram. Each task is
-  # its own `pi` process in its own workspace under /state/workspaces.
+  # isidore: run isolated Pi tasks from a web UI or Telegram. Each task is its
+  # own Node worker process (Pi TypeScript SDK) in /state/workspaces.
   isidore:
     <<: *hardening
     build:

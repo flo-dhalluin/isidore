@@ -67,9 +67,10 @@ with a read-only rootfs.)
 
 ## isidore (spawn tasks remotely)
 
-`isidore` is a small web service that turns a prompt into a fresh, isolated
-`pi` process. Each task gets its own workspace and `$HOME` under
-`/state/workspaces/<id>`, runs with `--no-session`, and is killed as a whole
+`isidore` is a small TypeScript web service that turns a prompt into a fresh,
+isolated worker process. The agent runs through the Pi TypeScript SDK inside
+that worker, so there is no `pi` CLI subprocess per task. Each task gets its own
+workspace and `$HOME` under `/state/workspaces/<id>`, and is killed as a whole
 process group on cancel or timeout. The UI is one minimalist HTML page at
 `http://127.0.0.1:8920/`; the same actions are available over a JSON API.
 

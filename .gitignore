@@ -9,5 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# Node
+node_modules/
+.npm-cache/
+
 # Test helpers (fake executables must live on an exec-capable mount)
 .isidore-test-bin-*

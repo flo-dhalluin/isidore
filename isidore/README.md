@@ -1,13 +1,17 @@
 # isidore
 
-Spawn isolated Pi coding-agent tasks from a minimalist web UI or a Telegram
-bot. isidore is the "front door" of the sandbox: it accepts a prompt, starts a
-fresh `pi` process in its own workspace, and streams the result back.
+Run isolated Pi coding-agent tasks from a minimalist web UI or a Telegram bot.
+isidore is the "front door" of the sandbox: it accepts a prompt, starts a fresh
+worker process in its own workspace, and streams the result back.
+
+It is a TypeScript/Node service. The agent runs through the Pi TypeScript SDK
+in a per-task worker process (`dist/worker.js`); there is no `pi` CLI
+subprocess per task.
 
 ```
-POST /api/tasks  ──►  PiRunner  ──►  pi --print --no-session --no-approve -- <prompt>
-                          │
-                          └──►  /state/workspaces/<task-id>/   (cwd + $HOME)
+POST /api/tasks  ──►  Runner  ──►  node worker.js  ──►  Pi TypeScript SDK
+                        │
+                        └──►  /state/workspaces/<task-id>/   (cwd + $HOME)
 ```
 
 ## Isolation
@@ -16,13 +20,13 @@ Each task is a separate process with:
 
 * its own working directory and `$HOME` under `/state/workspaces/<id>`;
 * its own Pi session store (`$HOME/sessions`), so conversation state lives and
-dies with the workspace;
+  dies with the workspace;
 * a fresh process group, so cancelling a task kills its whole tree;
-* no shell: the prompt is one argv element, never interpolated into a command.
+* no shell: the prompt is passed as JSON on stdin, never interpolated into a
+  command.
 
 A conversation is a chain of tasks that share the root task's workspace and
-Pi session, so a follow-up keeps the earlier files and history. Standalone
-runs use `--no-session` and leave nothing behind but their output.
+Pi session, so a follow-up keeps the earlier files and history.
 
 The Pi config directory (`/state/pi`) is shared so every task sees the same
 model catalog, `pi-web-access`, and MCP servers (browser + scheduler), but
@@ -83,21 +87,31 @@ a task finishes.
 |---|---|---|
 | `ISIDORE_STATE` | `/state` | tasks, workspaces, Pi config |
 | `ISIDORE_HOST` / `ISIDORE_PORT` | `0.0.0.0` / `8920` | listen address |
-| `ISIDORE_MODEL` | host default | model passed to `pi` |
+| `ISIDORE_MODEL` | host default | model passed to the worker |
 | `ISIDORE_MAX_WORKERS` | `2` | concurrent tasks |
 | `ISIDORE_TASK_TIMEOUT` | none | seconds before a task is killed |
 | `ISIDORE_PI_MODE` | `print` | `print` (final text) or `json` (live transcript) |
-| `ISIDORE_PI_BIN` | `pi` | Pi executable |
+| `ISIDORE_WORKER_SCRIPT` | `dist/worker.js` | Node worker that runs the Pi SDK |
+| `ISIDORE_WORKER_BIN` | `process.execPath` | Node binary used to run the worker |
 | `ISIDORE_TOKEN` | none | bearer token for the API/UI |
 | `ISIDORE_SCHEDULER_URL` | none | enables the schedule form |
 | `ISIDORE_SCHEDULER_TOKEN` | none | bearer token for the scheduler |
 | `ISIDORE_TELEGRAM_TOKEN` | none | enables the bot |
 | `ISIDORE_TELEGRAM_CHATS` | empty | allowed chat ids |
 
-## Tests
-
-The store and runner are pure Python and tested without a web server:
+## Development
 
 ```sh
-python3 -m unittest discover -s isidore/tests
+npm install
+npm run dev        # node --experimental-strip-types src/index.ts
+npm run build      # tsc -> dist/
+npm start          # node dist/index.js
+```
+
+## Tests
+
+The store and runner are pure TypeScript and tested without a web server:
+
+```sh
+npm test
 ```
