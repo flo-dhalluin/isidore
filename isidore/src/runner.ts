@@ -21,12 +21,11 @@ export interface RunnerOptions {
 export interface WorkerRequest {
   prompt: string;
   model: string | null;
-  mode: "print" | "json";
   sessionId: string;
 }
 
-export function buildWorkerRequest(task: Task, mode: "print" | "json", model: string | null): WorkerRequest {
-  return { prompt: task.prompt, model: task.model ?? model, mode, sessionId: rootId(task) };
+export function buildWorkerRequest(task: Task, model: string | null): WorkerRequest {
+  return { prompt: task.prompt, model: task.model ?? model, sessionId: rootId(task) };
 }
 
 /** Flatten a Pi message `content` value into plain text. */
@@ -52,27 +51,11 @@ function short(value: unknown): string {
   return text.length > 200 ? `${text.slice(0, 200)}…` : text;
 }
 
-/** Turn one JSON-mode record into a line for the human-readable transcript. */
+/** Extract streamed assistant text from a JSON-mode record. */
 export function summariseEvent(record: Record<string, unknown>): string | null {
-  const kind = record.type;
-  if (kind === "message_end") {
-    const message = (record.message ?? {}) as Record<string, unknown>;
-    if (message.role === "assistant") {
-      const text = textOf(message.content);
-      return text ? `\n${text}\n` : null;
-    }
-  }
-  if (kind === "tool_execution_start") {
-    return `\n> ${record.toolName ?? "tool"} ${short(record.args)}\n`;
-  }
-  if (kind === "tool_execution_end") {
-    return `${record.isError ? "!" : "✓"} ${record.toolName ?? "tool"}\n`;
-  }
-  if (kind === "message_update") {
-    const event = (record.assistantMessageEvent ?? {}) as Record<string, unknown>;
-    if (event.type === "text_delta") return (event.delta as string) ?? null;
-  }
-  return null;
+  if (record.type !== "message_update") return null;
+  const event = (record.assistantMessageEvent ?? {}) as Record<string, unknown>;
+  return event.type === "text_delta" ? ((event.delta as string) ?? null) : null;
 }
 
 function kill(proc: ChildProcess): void {
@@ -231,7 +214,7 @@ export class Runner {
     this.store.update(task);
     this.notify(task);
 
-    const request = buildWorkerRequest(task, this.mode, this.model);
+    const request = buildWorkerRequest(task, this.model);
     // In dev the worker is TypeScript; Node runs it with type stripping.
     const workerArgs = this.workerScript.endsWith(".ts")
       ? ["--experimental-strip-types", this.workerScript]
@@ -258,8 +241,7 @@ export class Runner {
     }
 
     try {
-      if (this.mode === "json") await this.consumeJson(task, proc);
-      else await this.consumePrint(task, proc);
+      await this.consumeJson(task, proc);
     } finally {
       if (timer) clearTimeout(timer);
       this.procs.delete(task.id);
@@ -267,26 +249,68 @@ export class Runner {
     }
   }
 
-  private consumePrint(task: Task, proc: ChildProcess): Promise<void> {
-    return new Promise((resolve) => {
-      const out: Buffer[] = [];
-      const err: Buffer[] = [];
-      proc.stdout?.on("data", (chunk: Buffer) => out.push(chunk));
-      proc.stderr?.on("data", (chunk: Buffer) => err.push(chunk));
-      proc.on("close", () => {
-        task.output = Buffer.concat(out).toString("utf8");
-        const stderr = Buffer.concat(err).toString("utf8").trim();
-        task.error = stderr || null;
-        resolve();
-      });
-    });
-  }
-
+  /**
+   * Parse the worker's JSONL event stream. Tool calls are collected as
+   * structured records; the transcript is built from streamed text. In print
+   * mode the transcript is replaced by the final assistant answer.
+   */
   private consumeJson(task: Task, proc: ChildProcess): Promise<void> {
     return new Promise((resolve) => {
       let buffer = "";
       let lastSave = 0;
+      let sawTextDelta = false;
+      let lastAssistantText = "";
       const err: Buffer[] = [];
+
+      const persist = (force: boolean): void => {
+        const now = Date.now();
+        if (!force && now - lastSave < 500) return;
+        this.store.update(task);
+        this.notify(task);
+        lastSave = now;
+      };
+
+      const handle = (record: Record<string, unknown>): void => {
+        const kind = record.type;
+        if (kind === "tool_execution_start") {
+          task.tool_calls.push({
+            id: String(record.toolCallId ?? ""),
+            name: String(record.toolName ?? "tool"),
+            args: short(record.args),
+            status: "running",
+          });
+          persist(true);
+          return;
+        }
+        if (kind === "tool_execution_end") {
+          const call = task.tool_calls.find((entry) => entry.id === String(record.toolCallId ?? ""));
+          if (call) {
+            call.status = record.isError ? "error" : "ok";
+            if (typeof record.durationMs === "number") call.duration_ms = record.durationMs;
+          }
+          persist(true);
+          return;
+        }
+        if (kind === "message_start") {
+          sawTextDelta = false;
+          return;
+        }
+        if (kind === "message_end") {
+          const message = (record.message ?? {}) as Record<string, unknown>;
+          if (message.role !== "assistant") return;
+          const text = textOf(message.content);
+          if (text) lastAssistantText = text;
+          // The streamed deltas already produced this text; keep only a separator.
+          task.output += sawTextDelta ? "\n" : text ? `\n${text}\n` : "";
+          persist(true);
+          return;
+        }
+        const text = summariseEvent(record);
+        if (!text) return;
+        if (kind === "message_update") sawTextDelta = true;
+        task.output += text;
+        persist(kind !== "message_update");
+      };
 
       proc.stdout?.on("data", (chunk: Buffer) => {
         buffer += chunk.toString("utf8");
@@ -300,19 +324,10 @@ export class Runner {
             record = JSON.parse(line) as Record<string, unknown>;
           } catch {
             task.output += `${line}\n`;
+            persist(false);
             continue;
           }
-          const text = summariseEvent(record);
-          if (text) {
-            task.output += text;
-            // Text deltas are frequent; persist them at most twice a second.
-            const now = Date.now();
-            if (record.type !== "message_update" || now - lastSave >= 500) {
-              this.store.update(task);
-              this.notify(task);
-              lastSave = now;
-            }
-          }
+          handle(record);
         }
       });
 
@@ -321,12 +336,12 @@ export class Runner {
       proc.on("close", () => {
         if (buffer.trim()) {
           try {
-            const text = summariseEvent(JSON.parse(buffer.trim()) as Record<string, unknown>);
-            if (text) task.output += text;
+            handle(JSON.parse(buffer.trim()) as Record<string, unknown>);
           } catch {
             task.output += `${buffer.trim()}\n`;
           }
         }
+        if (this.mode === "print" && lastAssistantText) task.output = lastAssistantText;
         const stderr = Buffer.concat(err).toString("utf8").trim();
         if (stderr) task.error = stderr.slice(-MAX_EVENT_TEXT);
         resolve();

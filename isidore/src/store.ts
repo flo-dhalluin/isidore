@@ -4,6 +4,16 @@ import { join } from "node:path";
 
 export type Status = "queued" | "running" | "succeeded" | "failed" | "cancelled" | "timeout";
 
+/** One tool invocation the agent made during a turn. */
+export interface ToolCall {
+  id: string;
+  name: string;
+  /** Short JSON of the call arguments, truncated for display. */
+  args: string;
+  status: "running" | "ok" | "error";
+  duration_ms?: number;
+}
+
 export const TERMINAL_STATUSES: ReadonlySet<Status> = new Set([
   "succeeded",
   "failed",
@@ -27,6 +37,7 @@ export interface Task {
   parent_id: string | null;
   thread_id: string | null;
   workspace: string | null;
+  tool_calls: ToolCall[];
 }
 
 export type PublicTask = Task & { done: boolean };
@@ -68,6 +79,7 @@ export function createTask(prompt: string, overrides: Partial<Task> = {}): Task 
     parent_id: null,
     thread_id: null,
     workspace: null,
+    tool_calls: [],
     ...overrides,
   };
 }
@@ -88,6 +100,7 @@ const KNOWN_FIELDS: ReadonlySet<string> = new Set([
   "parent_id",
   "thread_id",
   "workspace",
+  "tool_calls",
 ]);
 
 function fromDict(data: Record<string, unknown>): Task {

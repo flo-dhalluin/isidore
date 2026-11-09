@@ -1,7 +1,13 @@
 {% extends "base.html" %}
 {% block style %}
-  body { margin: 0 auto; max-width: 860px; padding: 2rem 1rem 4rem; background: var(--bg); color: var(--fg);
+  body { margin: 0; padding: 2rem 1rem 4rem; background: var(--bg); color: var(--fg);
          font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  /* Main column plus a schedule sidebar; collapses when the scheduler is off. */
+  .layout { display: grid; grid-template-columns: 1fr; gap: 1.5rem; align-items: start; }
+  .layout:has(#schedules:not([hidden])) { grid-template-columns: minmax(0, 1fr) 22rem; }
+  @media (max-width: 880px) { .layout:has(#schedules:not([hidden])) { grid-template-columns: 1fr; } }
+  aside { position: sticky; top: 2rem; max-height: calc(100dvh - 4rem); overflow-y: auto; }
   h1 { font-size: 1.1rem; letter-spacing: .18em; text-transform: uppercase; margin: 0 0 .25rem; }
   .sub { color: var(--muted); margin: 0 0 1.5rem; font-size: .85rem; }
   form { border: 1px solid var(--line); padding: 1rem; margin-bottom: 1.5rem; }
@@ -24,6 +30,20 @@
   .status { font-size: .75rem; text-transform: uppercase; letter-spacing: .08em; }
   .status.succeeded { color: #2f855a; } .status.failed, .status.timeout { color: #c53030; }
   .status.running { color: var(--accent); } .status.cancelled { color: var(--muted); }
+  .spinner { display: inline-block; width: .7em; height: .7em; margin-right: .35em; vertical-align: -.05em;
+             border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+             animation: spin .7s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .tools { margin-top: .4rem; }
+  .tools > summary { cursor: pointer; color: var(--muted); font-size: .75rem; list-style: none; }
+  .tools > summary::-webkit-details-marker { display: none; }
+  .tools > summary::before { content: "▸"; display: inline-block; width: 1em; }
+  .tools[open] > summary::before { content: "▾"; }
+  .tool-chips { display: flex; flex-wrap: wrap; gap: .3rem; margin-top: .4rem; }
+  .tool { font-size: .72rem; padding: .05rem .45rem; border: 1px solid var(--line); border-radius: 999px;
+          color: var(--muted); max-width: 16rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tool.running { border-color: var(--accent); color: var(--accent); }
+  .tool.error { border-color: #c53030; color: #c53030; }
   .prompt { margin: .35rem 0 0; white-space: pre-wrap; word-break: break-word; }
   /* Keep the list concise: two lines per prompt, answer and error. */
   .clamp { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
@@ -36,29 +56,35 @@
   .empty { color: var(--muted); }
   .err { color: #c53030; }
   h2 { font-size: .85rem; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin: 0 0 .6rem; }
-  #schedules { margin-bottom: 1.5rem; }
   .schedule { border: 1px solid var(--line); padding: .7rem .8rem; }
   .schedule header { display: flex; gap: .6rem; align-items: baseline; flex-wrap: wrap; }
+  .when { margin: .35rem 0 0; font-size: .8rem; color: var(--accent); }
   .meta { color: var(--muted); font-size: .8rem; margin: .35rem 0 0; }
 {% endblock %}
 {% block body %}
-<h1>isidore</h1>
-<p class="sub">spawn isolated Pi tasks &middot; <span id="count">0</span> total</p>
+<div class="wrap">
+  <h1>isidore</h1>
+  <p class="sub">spawn isolated Pi tasks &middot; <span id="count">0</span> total</p>
 
-<form id="run">
-  <textarea id="prompt" placeholder="What should the agent do?" required></textarea>
-  <div class="row">
-    <input id="model" placeholder="model (optional, e.g. openrouter/anthropic/claude-sonnet-4)">
-    <button type="submit">Run now</button>
+  <div class="layout">
+    <main>
+      <form id="run">
+        <textarea id="prompt" placeholder="What should the agent do?" required></textarea>
+        <div class="row">
+          <input id="model" placeholder="model (optional, e.g. openrouter/anthropic/claude-sonnet-4)">
+          <button type="submit">Run now</button>
+        </div>
+      </form>
+
+      <div class="tasks" id="tasks"><p class="empty">Loading…</p></div>
+    </main>
+
+    <aside id="schedules" hidden>
+      <h2>Scheduled</h2>
+      <div class="tasks" id="schedule-list"></div>
+    </aside>
   </div>
-</form>
-
-<section id="schedules" hidden>
-  <h2>Scheduled</h2>
-  <div class="tasks" id="schedule-list"></div>
-</section>
-
-<div class="tasks" id="tasks"><p class="empty">Loading…</p></div>
+</div>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -78,6 +104,28 @@ function openTask(id) {
   location.href = "/tasks/" + encodeURIComponent(id) + (TOKEN ? "?token=" + encodeURIComponent(TOKEN) : "");
 }
 
+const busy = (status) => status === "queued" || status === "running";
+const spinner = (status) => (busy(status) ? '<span class="spinner" aria-hidden="true"></span>' : "");
+// Remember which tool accordions are expanded, so the 3s refresh keeps them open.
+const openTools = new Set();
+
+function toolChips(calls) {
+  const shown = calls.slice(-6);
+  const extra = calls.length - shown.length;
+  return `<div class="tool-chips">${shown.map((c) =>
+    `<span class="tool ${esc(c.status)}" title="${esc(c.args)}">${esc(c.name)}</span>`).join("")}${
+    extra > 0 ? `<span class="tool">+${extra}</span>` : ""}</div>`;
+}
+
+function toolAccordion(root, calls) {
+  if (!calls || !calls.length) return "";
+  const open = openTools.has(root) ? " open" : "";
+  return `<details class="tools" data-tools="${esc(root)}"${open}>
+    <summary>${calls.length} tool call${calls.length === 1 ? "" : "s"}</summary>
+    ${toolChips(calls)}
+  </details>`;
+}
+
 function render(tasks) {
   $("count").textContent = tasks.length;
   if (!tasks.length) { $("tasks").innerHTML = '<p class="empty">No tasks yet.</p>'; return; }
@@ -95,18 +143,24 @@ function render(tasks) {
     <article class="task" data-open="${esc(root)}">
       <header>
         <span class="id">${esc(root)}</span>
-        <span class="status ${esc(t.status)}">${esc(t.status)}</span>
+        <span class="status ${esc(t.status)}">${spinner(t.status)}${esc(t.status)}</span>
         ${turns.length > 1 ? `<span class="badge">${turns.length} turns</span>` : ""}
         ${t.exit_code !== null && t.exit_code !== undefined ? `<span class="id">exit ${esc(t.exit_code)}</span>` : ""}
         ${t.done ? `<button class="ghost" data-delete="${esc(root)}">delete</button>` : `<button class="ghost" data-cancel="${esc(t.id)}">cancel</button>`}
       </header>
       <p class="prompt clamp">${esc(t.prompt)}</p>
+      ${toolAccordion(root, t.tool_calls)}
       ${t.output ? `<div class="md preview">${mdToHtml(t.output)}</div>` : ""}
       ${t.error ? `<pre class="err clamp">${esc(t.error)}</pre>` : ""}
     </article>`;
   }).join("");
   document.querySelectorAll("[data-open]").forEach((el) => {
     el.onclick = () => openTask(el.dataset.open);
+  });
+  document.querySelectorAll("details[data-tools]").forEach((el) => {
+    // Toggling the accordion must not open the task card.
+    el.querySelector("summary").onclick = (ev) => ev.stopPropagation();
+    el.ontoggle = () => { el.open ? openTools.add(el.dataset.tools) : openTools.delete(el.dataset.tools); };
   });
   document.querySelectorAll("[data-cancel]").forEach((b) => {
     b.onclick = async (ev) => { ev.stopPropagation(); b.disabled = true; try { await api("/api/tasks/" + b.dataset.cancel + "/cancel", {method: "POST"}); } catch (e) { alert(e.message); } refresh(); };
@@ -135,6 +189,24 @@ function fmtTime(iso) {
   return isNaN(d) ? esc(iso) : esc(d.toLocaleString());
 }
 
+/** Relative hint for a scheduled time, e.g. " (in 5m)" or " (2h ago)". */
+function relTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  const diff = d.getTime() - Date.now();
+  const mins = Math.round(Math.abs(diff) / 60000);
+  const text = mins < 1 ? "now" : mins < 60 ? mins + "m" : mins < 1440 ? Math.round(mins / 60) + "h" : Math.round(mins / 1440) + "d";
+  if (text === "now") return " (now)";
+  return diff >= 0 ? ` (in ${text})` : ` (${text} ago)`;
+}
+
+/** The scheduled time: the absolute run time for a one-shot, or the cadence and next run. */
+function scheduleWhen(s) {
+  if (s.mode === "once") return `at ${fmtTime(s.at)}${relTime(s.at)}`;
+  return `every ${fmtEvery(s.every)} &middot; next ${fmtTime(s.next_run)}${relTime(s.next_run)}`;
+}
+
 function renderSchedules(items) {
   const active = items.filter((s) => s.enabled);
   if (!active.length) { $("schedule-list").innerHTML = '<p class="empty">No scheduled tasks.</p>'; return; }
@@ -146,9 +218,8 @@ function renderSchedules(items) {
         <button class="ghost" data-unschedule="${esc(s.id)}">cancel</button>
       </header>
       <p class="prompt clamp">${esc(s.prompt)}</p>
-      <p class="meta">${s.mode === "once" ? "at " + fmtTime(s.at) : "every " + fmtEvery(s.every)}
-        &middot; next ${fmtTime(s.next_run)} &middot; runs ${esc(s.runs)}
-        ${s.last_error ? `&middot; <span class="err">${esc(s.last_error)}</span>` : ""}</p>
+      <p class="when">${scheduleWhen(s)}</p>
+      <p class="meta">runs ${esc(s.runs)}${s.last_error ? ` &middot; <span class="err">${esc(s.last_error)}</span>` : ""}</p>
     </article>`).join("");
   document.querySelectorAll("[data-unschedule]").forEach((b) => {
     b.onclick = async () => {

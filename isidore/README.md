@@ -37,12 +37,15 @@ its own container.
 ## Web UI
 
 `http://127.0.0.1:8920/` (bound to loopback by compose). The page is a single
-HTML document: a prompt box, an optional model, a task list, and — when the
-scheduler is configured — a one-shot/interval schedule form. The list groups
-follow-ups under their root task; clicking a task opens a full-screen
-conversation page where you can read the transcript, cancel a running turn,
-ask follow-up questions, or delete a finished conversation (records **and**
-workspace). Agent answers are rendered as HTML by a small, dependency-free
+HTML document: a prompt box, an optional model, and a task list, with — when
+the scheduler is configured — a sidebar listing the active schedules and their
+scheduled time (next run, with a relative hint). The list groups follow-ups
+under their root task; clicking a task opens a full-screen conversation page
+where you can read the transcript, cancel a running turn, ask follow-up
+questions, or delete a finished conversation (records **and** workspace). Each
+task shows the tools the agent called (name, arguments and outcome) in a
+collapsible accordion, and a spinner marks a queued or running task while it
+waits to finish. Agent answers are rendered as HTML by a small, dependency-free
 Markdown renderer in the page (headings, lists, code blocks, tables, links);
 the source is HTML-escaped first and unsafe URL schemes are refused, so agent
 output cannot inject markup.
@@ -90,7 +93,7 @@ a task finishes.
 | `ISIDORE_MODEL` | host default | model passed to the worker |
 | `ISIDORE_MAX_WORKERS` | `2` | concurrent tasks |
 | `ISIDORE_TASK_TIMEOUT` | none | seconds before a task is killed |
-| `ISIDORE_PI_MODE` | `print` | `print` (final text) or `json` (live transcript) |
+| `ISIDORE_PI_MODE` | `print` | `print` (final answer) or `json` (full transcript); the worker always emits the event stream, so tool calls are captured either way |
 | `ISIDORE_WORKER_SCRIPT` | `dist/worker.js` | Node worker that runs the Pi SDK |
 | `ISIDORE_WORKER_BIN` | `process.execPath` | Node binary used to run the worker |
 | `ISIDORE_TOKEN` | none | bearer token for the API/UI |

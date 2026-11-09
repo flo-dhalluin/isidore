@@ -3,8 +3,10 @@
  *
  * The server spawns this script once per task, in the task's workspace, with
  * the task's isolated HOME/TMPDIR/PI_CODING_AGENT_SESSION_DIR. It reads a JSON
- * request from stdin, runs the task through the SDK, and writes the same JSONL
- * event stream as `pi --mode json` (or the final text for print mode) to stdout.
+ * request from stdin, runs the task through the SDK, and always writes the same
+ * JSONL event stream as `pi --mode json` to stdout. The server derives the
+ * human-readable transcript (and the final answer for print mode) from it, so
+ * tool calls are captured for every task.
  *
  * This replaces the `pi` CLI subprocess: the agent runs in this Node process,
  * not as a separate `pi` process. The server's event parser and the web UI are
@@ -29,7 +31,6 @@ import {
 interface WorkerRequest {
   prompt: string;
   model?: string | null;
-  mode?: "print" | "json";
   sessionId?: string | null;
   thinkingLevel?: string | null;
 }
@@ -130,31 +131,24 @@ async function main(): Promise<number> {
     sessionManager,
   });
 
-  const mode = request.mode ?? "print";
   let unsubscribe: (() => void) | undefined;
   let exitCode = 0;
 
   try {
-    if (mode === "json") {
-      const header = session.sessionManager.getHeader();
-      if (header) process.stdout.write(`${JSON.stringify(header)}\n`);
-      unsubscribe = session.subscribe((event) => {
-        process.stdout.write(`${JSON.stringify(toJsonEvent(event))}\n`);
-      });
-    }
+    const header = session.sessionManager.getHeader();
+    if (header) process.stdout.write(`${JSON.stringify(header)}\n`);
+    unsubscribe = session.subscribe((event) => {
+      process.stdout.write(`${JSON.stringify(toJsonEvent(event))}\n`);
+    });
 
     await session.bindExtensions({});
     await session.prompt(request.prompt);
 
-    if (mode === "print") {
-      const text = session.getLastAssistantText();
-      if (text) process.stdout.write(`${text}\n`);
-      const messages = session.state.messages;
-      const last = messages[messages.length - 1];
-      if (last?.role === "assistant" && (last.stopReason === "error" || last.stopReason === "aborted")) {
-        process.stderr.write(`${last.errorMessage || `Request ${last.stopReason}`}\n`);
-        exitCode = 1;
-      }
+    const messages = session.state.messages;
+    const last = messages[messages.length - 1];
+    if (last?.role === "assistant" && (last.stopReason === "error" || last.stopReason === "aborted")) {
+      process.stderr.write(`${last.errorMessage || `Request ${last.stopReason}`}\n`);
+      exitCode = 1;
     }
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);

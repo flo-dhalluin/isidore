@@ -12,6 +12,10 @@
   .status { font-size: .75rem; text-transform: uppercase; letter-spacing: .08em; }
   .status.succeeded { color: #2f855a; } .status.failed, .status.timeout { color: #c53030; }
   .status.running { color: var(--accent); } .status.cancelled, .status.queued { color: var(--muted); }
+  .spinner { display: inline-block; width: .7em; height: .7em; margin-right: .35em; vertical-align: -.05em;
+             border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+             animation: spin .7s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
   a { color: var(--accent); text-decoration: none; }
   a:hover { text-decoration: underline; }
   main { flex: 1; overflow: auto; }
@@ -23,6 +27,20 @@
   .ask { background: rgba(127,127,127,.1); border-left: 3px solid var(--accent); padding: .6rem .8rem; }
   .answer { margin-top: 1rem; padding-left: .8rem; border-left: 3px solid var(--line); }
   .answer .md { margin-top: .4rem; }
+  .tools { margin-top: .5rem; }
+  .tools > summary { cursor: pointer; color: var(--muted); font-size: .78rem; list-style: none; }
+  .tools > summary::-webkit-details-marker { display: none; }
+  .tools > summary::before { content: "▸"; display: inline-block; width: 1em; }
+  .tools[open] > summary::before { content: "▾"; }
+  .tool-rows { display: grid; gap: .25rem; margin-top: .4rem; }
+  .tool { display: flex; gap: .5rem; align-items: baseline; font-size: .78rem; padding: .25rem .5rem;
+          border: 1px solid var(--line); border-left: 3px solid var(--line); border-radius: 3px; }
+  .tool.running { border-left-color: var(--accent); }
+  .tool.error { border-left-color: #c53030; }
+  .tool .tool-name { flex: 0 0 auto; font-weight: 600; }
+  .tool .tool-args { flex: 1 1 auto; color: var(--muted); overflow: hidden; text-overflow: ellipsis;
+                     white-space: nowrap; background: none; padding: 0; }
+  .tool .tool-meta { flex: 0 0 auto; color: var(--muted); font-size: .72rem; }
   pre { margin: .6rem 0 0; padding: .6rem; background: rgba(127,127,127,.08); overflow: auto;
         white-space: pre-wrap; word-break: break-word; font-size: .85rem; }
   .foot { display: flex; gap: .6rem; align-items: baseline; flex-wrap: wrap; margin-top: .5rem; }
@@ -82,20 +100,42 @@ async function api(path, opts) {
 let lastSig = null;
 let lastTurns = 0;
 
+const busy = (status) => status === "queued" || status === "running";
+const spinner = (status) => (busy(status) ? '<span class="spinner" aria-hidden="true"></span>' : "");
+// Remember which tool accordions are expanded, so the 2s refresh keeps them open.
+const openTools = new Set();
+
+function toolList(task) {
+  const calls = task.tool_calls || [];
+  if (!calls.length) return "";
+  const open = openTools.has(task.id) ? " open" : "";
+  return `<details class="tools" data-tools="${esc(task.id)}"${open}>
+    <summary>${calls.length} tool call${calls.length === 1 ? "" : "s"}</summary>
+    <div class="tool-rows">${calls.map((c) => `
+      <div class="tool ${esc(c.status)}">
+        <span class="tool-name">${esc(c.name)}</span>
+        <code class="tool-args">${esc(c.args)}</code>
+        <span class="tool-meta">${esc(c.status)}${c.duration_ms !== undefined && c.duration_ms !== null ? ` · ${esc(c.duration_ms)}ms` : ""}</span>
+      </div>`).join("")}</div>
+  </details>`;
+}
+
 function turn(task) {
+  const hasTools = task.tool_calls && task.tool_calls.length;
   return `
     <article class="turn">
       <section class="ask">
         <span class="who">you</span>
         <p class="prompt">${esc(task.prompt)}</p>
       </section>
-      ${task.output || task.error ? `<section class="answer">
+      ${task.output || task.error || hasTools ? `<section class="answer">
         <span class="who">agent</span>
+        ${toolList(task)}
         ${task.output ? `<div class="md">${mdToHtml(task.output)}</div>` : ""}
         ${task.error ? `<pre class="err">${esc(task.error)}</pre>` : ""}
       </section>` : ""}
       <div class="foot">
-        <span class="status ${esc(task.status)}">${esc(task.status)}</span>
+        <span class="status ${esc(task.status)}">${spinner(task.status)}${esc(task.status)}</span>
         <span class="badge">${esc(task.id)}</span>
         ${task.exit_code !== null && task.exit_code !== undefined ? `<span class="badge">exit ${esc(task.exit_code)}</span>` : ""}
       </div>
@@ -105,20 +145,26 @@ function turn(task) {
 function render(data) {
   $("root").textContent = data.id;
   const last = data.turns[data.turns.length - 1];
-  $("status").textContent = last ? last.status : "";
+  $("status").innerHTML = last ? spinner(last.status) + esc(last.status) : "";
   $("status").className = "status " + (last ? last.status : "");
   const running = data.running;
   $("cancel").hidden = !running;
   if (running && last) $("cancel").dataset.id = last.id;
   $("delete").hidden = running || !data.turns.length;
   $("send").disabled = running;
-  $("hint").textContent = running ? "waiting for the current turn to finish…" : "answers keep this conversation's workspace and session";
+  $("hint").innerHTML = running
+    ? '<span class="spinner" aria-hidden="true"></span>waiting for the current turn to finish…'
+    : "answers keep this conversation's workspace and session";
   // Re-render only when something changed, so reading/scrolling is not disturbed.
-  const sig = data.turns.map((t) => [t.id, t.status, t.output.length, t.error || ""].join(":")).join("|");
+  const sig = data.turns.map((t) => [t.id, t.status, t.output.length, t.error || "",
+    (t.tool_calls || []).map((c) => c.name + c.status).join(",")].join(":")).join("|");
   if (sig === lastSig) return;
   const main = document.querySelector("main");
   const atBottom = main.scrollHeight - main.scrollTop - main.clientHeight < 80;
   $("turns").innerHTML = data.turns.map(turn).join("");
+  document.querySelectorAll("details[data-tools]").forEach((el) => {
+    el.ontoggle = () => { el.open ? openTools.add(el.dataset.tools) : openTools.delete(el.dataset.tools); };
+  });
   if (data.turns.length !== lastTurns || atBottom || running) main.scrollTop = main.scrollHeight;
   lastSig = sig;
   lastTurns = data.turns.length;
