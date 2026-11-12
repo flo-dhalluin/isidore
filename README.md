@@ -151,11 +151,18 @@ no public URL or open port. A [webhook](#webhook-optional) is optional.
 4. **Use it**: send plain text or `/new <prompt>` to queue a task; `/list`,
    `/status <id>`, `/cancel <id>`, `/help`. The originating chat gets the task's
    output when it finishes (split into several messages if long).
+   **Reply** to any of the bot's task messages to continue that conversation:
+   the reply becomes the next turn of the thread, with the same workspace and
+   Pi session (refused while a turn of it is still running).
+   Schedules the agent creates from a Telegram task (`schedule_task`) post
+   each run's result back to that chat.
 
 Notes:
 
 - Messages from chats not in `ISIDORE_TELEGRAM_CHATS` are silently ignored; an
-  empty list disables everyone.
+  empty list disables everyone. Results are only ever posted to allowed chats.
+- Only final results are posted, not progress or tool calls; the web UI shows
+  those.
 - Every allowed chat sees and can cancel **all** tasks (`/list`, `/status` are
   not scoped per chat), including ones started from the web UI.
 - In polling mode isidore deletes any webhook left on the bot at startup;

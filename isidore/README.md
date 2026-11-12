@@ -90,8 +90,14 @@ authenticated by Telegram's `X-Telegram-Bot-Api-Secret-Token` header, not by
 `ISIDORE_TOKEN`; the secret defaults to an HMAC of the bot token
 (override with `ISIDORE_TELEGRAM_WEBHOOK_SECRET[_FILE]`). An empty allow-list denies
 everyone. Commands: `/new <prompt>` (plain text also works), `/list`,
-`/status <id>`, `/cancel <id>`, `/help`. The originating chat is notified when
-a task finishes.
+`/status <id>`, `/cancel <id>`, `/help`. The originating chat is notified once
+when a task finishes (only if it is an allowed chat). Replying to a bot message
+that names a task queues a follow-up turn in that task's thread.
+
+Each worker gets `ISIDORE_TASK_ORIGIN` (e.g. `telegram:<chat>`), which the
+entrypoint's `mcp.json` sends to the scheduler as `X-Isidore-Origin`; a
+schedule created from a Telegram task fires its tasks with that origin, so
+their results go back to the chat.
 
 ## Configuration
 

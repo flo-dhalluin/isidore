@@ -15,7 +15,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import Annotated
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
@@ -55,6 +55,18 @@ READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
 MUTATING = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False)
 
 
+# isidore's mcp.json sends each task's origin in this header (interpolated from
+# the worker's ISIDORE_TASK_ORIGIN); schedules created from a Telegram task
+# report back to that chat.
+ORIGIN_HEADER = "x-isidore-origin"
+
+
+def _reply_to(ctx: Context | None) -> str | None:
+    headers = ctx.headers if ctx is not None else None
+    origin = (headers or {}).get(ORIGIN_HEADER, "").strip()
+    return origin if origin.startswith("telegram:") else None
+
+
 def _dump(schedule: Schedule) -> str:
     return json.dumps(schedule.public(), indent=2, sort_keys=True)
 
@@ -72,12 +84,15 @@ async def schedule_task(
         Field(description="Recurring interval, e.g. '30m', '2h', '1d' (mutually exclusive with at)"),
     ] = None,
     model: Annotated[str | None, Field(description="Optional model override for the task")] = None,
+    ctx: Context | None = None,
 ) -> str:
     """Schedule a task: one-shot at `at`, or recurring every `every`."""
     if not prompt.strip():
         raise ToolError("prompt is required")
     try:
-        schedule = scheduler.add(prompt.strip(), at=at, every=every, model=model, origin="tool")
+        schedule = scheduler.add(
+            prompt.strip(), at=at, every=every, model=model, origin="tool", reply_to=_reply_to(ctx)
+        )
     except ValueError as exc:
         raise ToolError(str(exc)) from None
     return _dump(schedule)

@@ -221,7 +221,9 @@ export class Runner {
       : [this.workerScript];
     const proc = spawn(this.workerBin, workerArgs, {
       cwd: workspace,
-      env: this.env(workspace),
+      // The task's origin, interpolated into the scheduler MCP headers
+      // (X-Isidore-Origin) so schedules it creates can report back to it.
+      env: { ...this.env(workspace), ISIDORE_TASK_ORIGIN: task.origin || "web" },
       stdio: ["pipe", "pipe", "pipe"],
       // Own process group: cancelling a task kills its whole tree.
       detached: true,

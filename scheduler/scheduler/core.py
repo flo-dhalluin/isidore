@@ -111,6 +111,9 @@ class Schedule:
     enabled: bool = True
     model: str | None = None
     origin: str = "tool"
+    # Origin given to the tasks this schedule spawns, e.g. "telegram:<chat>" so
+    # their results go back to the chat that created the schedule.
+    reply_to: str | None = None
     last_task_id: str | None = None
     last_error: str | None = None
 
@@ -275,7 +278,7 @@ class Scheduler:
                 schedule.prompt,
                 model=schedule.model,
                 schedule_id=schedule.id,
-                origin="scheduler",
+                origin=schedule.reply_to or "scheduler",
             )
         except Exception as exc:  # noqa: BLE001 - keep the scheduler alive
             schedule.last_error = str(exc)

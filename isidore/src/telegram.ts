@@ -1,7 +1,8 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Runner } from "./runner.ts";
-import type { Task, TaskStore } from "./store.ts";
+import { isDone, rootId, type Task, type TaskStore } from "./store.ts";
 
+const TASK_ID = /\bt_[0-9a-f]{12}\b/;
 const MAX_MESSAGE = 3_800; // Telegram's hard limit is 4096; leave room for a header.
 
 function chunks(text: string, size = MAX_MESSAGE): string[] {
@@ -39,11 +40,15 @@ export class TelegramBot {
   private readonly pollTimeout: number;
   readonly webhookUrl: string | null;
   private readonly webhookSecret: string;
+  private readonly botId: string;
+  /** Tasks whose final state was already posted (cancel reports twice). */
+  private readonly notified = new Set<string>();
   private offset = 0;
   private stopped = false;
 
   constructor(token: string, runner: Runner, store: TaskStore, allowedChats: Set<string>, options: TelegramOptions = {}) {
     this.token = token;
+    this.botId = token.split(":", 1)[0];
     this.runner = runner;
     this.store = store;
     this.allowedChats = allowedChats;
@@ -139,8 +144,11 @@ export class TelegramBot {
     return updates;
   }
 
-  async send(chatId: string | number, text: string): Promise<void> {
-    for (const chunk of chunks(text)) {
+  /** Send `text`, split into several messages; `tag` prefixes every part after the first. */
+  async send(chatId: string | number, text: string, tag?: string): Promise<void> {
+    const parts = chunks(text);
+    for (const [index, part] of parts.entries()) {
+      const chunk = tag && index > 0 ? `${tag} (${index + 1}/${parts.length})\n${part}` : part;
       try {
         await fetch(`${this.apiBase}/bot${this.token}/sendMessage`, {
           method: "POST",
@@ -165,6 +173,18 @@ export class TelegramBot {
     const command = rawCommand.split("@")[0].toLowerCase();
     const rest = restParts.join(" ").trim();
 
+    // A reply to one of this bot's task messages continues that conversation.
+    const replyTo = (message.reply_to_message ?? null) as Record<string, unknown> | null;
+    if (replyTo && !command.startsWith("/")) {
+      const from = (replyTo.from ?? {}) as Record<string, unknown>;
+      const taskId = String(replyTo.text ?? "").match(TASK_ID)?.[0];
+      const task = taskId && String(from.id ?? "") === this.botId ? this.store.get(taskId) : null;
+      if (task) {
+        await this.followup(chatId, task, text);
+        return;
+      }
+    }
+
     if (command === "/start" || command === "/help") await this.send(chatId, this.help());
     else if (command === "/new") {
       if (!rest) await this.send(chatId, "Usage: /new <prompt>");
@@ -179,6 +199,25 @@ export class TelegramBot {
   private async create(chatId: string, prompt: string): Promise<void> {
     const task = this.runner.create(prompt, { origin: `telegram:${chatId}` });
     await this.send(chatId, `Queued ${task.id}\n${prompt.slice(0, 500)}`);
+  }
+
+  /** Continue `task`'s conversation: the prompt becomes the next turn of its thread. */
+  private async followup(chatId: string, task: Task, prompt: string): Promise<void> {
+    const root = rootId(task);
+    const turns = this.store.thread(root);
+    const running = turns.find((turn) => !isDone(turn));
+    if (running) {
+      await this.send(chatId, `${running.id} is still running; wait for it or /cancel ${running.id}.`);
+      return;
+    }
+    const parent = turns[turns.length - 1] ?? task;
+    const next = this.runner.create(prompt, {
+      parent_id: parent.id,
+      thread_id: root,
+      model: parent.model,
+      origin: `telegram:${chatId}`,
+    });
+    await this.send(chatId, `Queued ${next.id} (follow-up of ${root})\n${prompt.slice(0, 500)}`);
   }
 
   private async list(chatId: string): Promise<void> {
@@ -199,7 +238,7 @@ export class TelegramBot {
       await this.send(chatId, `No task ${JSON.stringify(taskId)}.`);
       return;
     }
-    await this.send(chatId, this.formatTask(task));
+    await this.send(chatId, this.formatTask(task), task.id);
   }
 
   private async cancel(chatId: string, taskId: string): Promise<void> {
@@ -215,13 +254,18 @@ export class TelegramBot {
   async notify(task: Task): Promise<void> {
     if (!task.origin.startsWith("telegram:")) return;
     const chatId = task.origin.split(":", 2)[1];
-    if (task.status === "running" || task.status === "queued") return;
-    await this.send(chatId, this.formatTask(task));
+    // The origin can come from the API or a schedule: only post to allowed chats.
+    if (!this.allowedChats.has(chatId)) return;
+    if (!isDone(task) || this.notified.has(task.id)) return;
+    this.notified.add(task.id);
+    await this.send(chatId, this.formatTask(task), task.id);
   }
 
   private formatTask(task: Task): string {
     let head = `${task.id}  ${task.status}`;
     if (task.exit_code !== null) head += `  (exit ${task.exit_code})`;
+    if (task.schedule_id) head += `  [schedule ${task.schedule_id}]`;
+    if (task.thread_id) head += `  [follow-up of ${task.thread_id}]`;
     let body = task.output.trim();
     if (task.error) body += `\n\nstderr:\n${task.error.trim()}`;
     return `${head}\n${task.prompt.slice(0, 300)}\n\n${body}`.trim();
@@ -232,6 +276,7 @@ export class TelegramBot {
       "isidore - spawn isolated Pi tasks",
       "",
       "/new <prompt>   create a task (plain text also works)",
+      "reply to a task message to continue that conversation",
       "/list           recent tasks",
       "/status <id>    task details and output",
       "/cancel <id>    cancel a task",

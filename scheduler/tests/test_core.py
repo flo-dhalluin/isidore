@@ -109,6 +109,20 @@ class SchedulerTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_reply_to_becomes_task_origin(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                spawner = FakeSpawner()
+                store, scheduler = self.make(tmp, spawner)
+                past = utcnow() - timedelta(seconds=1)
+                scheduler.add_once("p", past, reply_to="telegram:42")
+                scheduler.add_once("q", past)
+                await scheduler.tick_once()
+                origins = {prompt: kwargs["origin"] for prompt, kwargs in spawner.calls}
+                self.assertEqual(origins, {"p": "telegram:42", "q": "scheduler"})
+
+        asyncio.run(scenario())
+
     def test_interval_advances(self):
         async def scenario():
             with tempfile.TemporaryDirectory() as tmp:

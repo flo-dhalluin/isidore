@@ -24,7 +24,9 @@ if [ "$seed_tag" != "$(cat "$PI_CODING_AGENT_DIR/.seed" 2>/dev/null || true)" ];
 	pi update --models >/dev/null 2>&1 || true
 fi
 
-# MCP servers available to every spawned task. Entries are removed again when
+# MCP servers available to every spawned task. Pi expands ${VAR} in header
+# values from the worker's environment; the runner sets ISIDORE_TASK_ORIGIN
+# per task so the scheduler knows where a schedule came from. Entries are removed again when
 # the corresponding URL is unset, so the state dir stays consistent.
 mcp_file="$PI_CODING_AGENT_DIR/mcp.json"
 [ -s "$mcp_file" ] || printf '{}\n' >"$mcp_file"
@@ -41,12 +43,12 @@ fi
 if [ -n "${PI_SANDBOX_SCHEDULER_URL:-}" ]; then
 	if [ -n "${ISIDORE_SCHEDULER_TOKEN:-}" ]; then
 		jq --arg url "$PI_SANDBOX_SCHEDULER_URL" --arg token "$ISIDORE_SCHEDULER_TOKEN" '.mcpServers.scheduler = {
-			url: $url, headers: {Authorization: ("Bearer " + $token)}, exposure: "direct", timeout: 30,
+			url: $url, headers: {Authorization: ("Bearer " + $token), "X-Isidore-Origin": "${ISIDORE_TASK_ORIGIN}"}, exposure: "direct", timeout: 30,
 			description: "Schedule one-shot or recurring tasks that spawn isolated Pi agents"
 		}' "$mcp_file" >"$mcp_file.tmp" && mv "$mcp_file.tmp" "$mcp_file"
 	else
 		jq --arg url "$PI_SANDBOX_SCHEDULER_URL" '.mcpServers.scheduler = {
-			url: $url, exposure: "direct", timeout: 30,
+			url: $url, headers: {"X-Isidore-Origin": "${ISIDORE_TASK_ORIGIN}"}, exposure: "direct", timeout: 30,
 			description: "Schedule one-shot or recurring tasks that spawn isolated Pi agents"
 		}' "$mcp_file" >"$mcp_file.tmp" && mv "$mcp_file.tmp" "$mcp_file"
 	fi

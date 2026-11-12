@@ -37,12 +37,18 @@ automatically when `PI_SANDBOX_SCHEDULER_URL` is set:
   "mcpServers": {
     "scheduler": {
       "url": "http://scheduler:8940/mcp",
+      "headers": { "X-Isidore-Origin": "${ISIDORE_TASK_ORIGIN}" },
       "exposure": "direct",
       "timeout": 30
     }
   }
 }
 ```
+
+Pi expands `${ISIDORE_TASK_ORIGIN}` from the calling task's environment. When
+`schedule_task` receives `X-Isidore-Origin: telegram:<chat>`, the schedule
+stores it as `reply_to` and fires its tasks with that origin instead of
+`scheduler`, so isidore posts their results to that Telegram chat.
 
 ## REST API
 
