@@ -8,7 +8,7 @@
 #
 # See README.md. The key is a file (compose secret), never an env var or an
 # image layer.
-name: pi-sandbox
+name: isidore
 
 x-hardening: &hardening
   init: true
@@ -56,7 +56,7 @@ services:
       - "127.0.0.1:${ISIDORE_PORT:-8920}:8920"
     volumes:
       - ${ISIDORE_STATE:-${XDG_STATE_HOME:-${HOME}/.local/state}/pi-sandbox/isidore}:/state
-    secrets: [openrouter]
+    secrets: [openrouter, telegram]
     environment:
       ISIDORE_STATE: /state
       ISIDORE_HOST: 0.0.0.0
@@ -67,8 +67,11 @@ services:
       ISIDORE_TOKEN: ${ISIDORE_TOKEN:-}
       ISIDORE_SCHEDULER_URL: http://scheduler:8940
       ISIDORE_SCHEDULER_TOKEN: ${SCHEDULER_TOKEN:-}
-      ISIDORE_TELEGRAM_TOKEN: ${ISIDORE_TELEGRAM_TOKEN:-}
+      ISIDORE_TELEGRAM_TOKEN_FILE: /run/secrets/telegram
       ISIDORE_TELEGRAM_CHATS: ${ISIDORE_TELEGRAM_CHATS:-}
+      # Optional public HTTPS URL proxied to isidore's /telegram/webhook;
+      # empty = long polling.
+      ISIDORE_TELEGRAM_WEBHOOK_URL: ${ISIDORE_TELEGRAM_WEBHOOK_URL:-}
       PI_SANDBOX_BROWSER_URL: http://browser:8931/mcp
       PI_SANDBOX_SCHEDULER_URL: http://scheduler:8940/mcp
       NO_PROXY: ${NO_PROXY:-127.0.0.0/8,localhost},browser,scheduler,isidore
@@ -122,3 +125,7 @@ secrets:
   # secrets need a writable rootfs).
   openrouter:
     file: ${PI_SANDBOX_KEY_FILE:-/dev/null}
+  # Telegram bot token, read by isidore itself (never exported to tasks).
+  # Empty (/dev/null) disables the bot.
+  telegram:
+    file: ${ISIDORE_TELEGRAM_TOKEN_FILE:-/dev/null}

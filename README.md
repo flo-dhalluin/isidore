@@ -64,8 +64,9 @@ Compose reads these from the environment (or a `.env` file beside
 | `ISIDORE_TOKEN` | none | bearer token for the isidore API/UI |
 | `ISIDORE_MAX_WORKERS` | `2` | concurrent tasks |
 | `ISIDORE_TASK_TIMEOUT` | none | seconds before a task is killed |
-| `ISIDORE_TELEGRAM_TOKEN` | none | enables the Telegram bot |
+| `ISIDORE_TELEGRAM_TOKEN_FILE` | `/dev/null` | file holding the Telegram bot token (compose secret); enables the bot |
 | `ISIDORE_TELEGRAM_CHATS` | empty | allowed Telegram chat ids |
+| `ISIDORE_TELEGRAM_WEBHOOK_URL` | none | public HTTPS URL for Telegram webhooks; unset = long polling |
 | `SCHEDULER_TOKEN` | none | bearer token for the scheduler |
 | `BROWSER_MCP_ALLOW_JS` | `0` | expose `browser_evaluate` (arbitrary JS) |
 | `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL` | `pi-sandbox` / `pi-sandbox@localhost` | git identity inside tasks |
@@ -113,10 +114,87 @@ open http://127.0.0.1:8920/            # or curl -X POST localhost:8920/api/task
                                        #   -d '{"prompt":"list the files here"}'
 ```
 
-A Telegram bot is enabled by setting `ISIDORE_TELEGRAM_TOKEN` and
-`ISIDORE_TELEGRAM_CHATS` (comma-separated allow-list). It long-polls, so no
-public webhook is needed; plain text or `/new <prompt>` creates a task and the
-chat is notified when it finishes. See [isidore/README.md](isidore/README.md).
+### Telegram
+
+isidore can be driven from a Telegram chat. By default the bot long-polls
+Telegram (`getUpdates`), so it only needs outbound HTTPS to `api.telegram.org`:
+no public URL or open port. A [webhook](#webhook-optional) is optional.
+
+1. **Create the bot**: in Telegram, talk to [@BotFather](https://t.me/BotFather),
+   send `/newbot`, pick a name and username, and copy the token
+   (`123456789:AA...`).
+2. **Find your chat id**: send your bot any message (for a group, add the bot to
+   the group and post in it first), then, *before* isidore starts polling with
+   that token (polling consumes the updates):
+
+   ```sh
+   curl -s "https://api.telegram.org/bot<token>/getUpdates" | jq '.result[].message.chat.id'
+   ```
+
+   Private chats have a positive id, groups a negative one (`-100...`).
+3. **Configure isidore**: store the token in a 0600 file, like the OpenRouter
+   key, and point compose at it in `.env` (or the environment of
+   `docker compose`):
+
+   ```sh
+   (umask 077; printf '%s' '123456789:AA...' > ~/.telegram-token)
+   ```
+
+   ```sh
+   ISIDORE_TELEGRAM_TOKEN_FILE=$HOME/.telegram-token
+   ISIDORE_TELEGRAM_CHATS=111111111,-1002222222222   # comma-separated allow-list
+   ```
+
+   then `docker compose up -d` to recreate the container.
+   `curl localhost:8920/api/info` (plus `-H "Authorization: Bearer $ISIDORE_TOKEN"`
+   if set) should report `"telegram": true, "telegram_mode": "polling"`.
+4. **Use it**: send plain text or `/new <prompt>` to queue a task; `/list`,
+   `/status <id>`, `/cancel <id>`, `/help`. The originating chat gets the task's
+   output when it finishes (split into several messages if long).
+
+Notes:
+
+- Messages from chats not in `ISIDORE_TELEGRAM_CHATS` are silently ignored; an
+  empty list disables everyone.
+- Every allowed chat sees and can cancel **all** tasks (`/list`, `/status` are
+  not scoped per chat), including ones started from the web UI.
+- In polling mode isidore deletes any webhook left on the bot at startup;
+  polling still fails if another process polls the same token.
+- The token file is mounted read-only at `/run/secrets/telegram` (the
+  `telegram` compose secret) and read by the isidore service itself: it never
+  appears in an env var, `docker inspect`, or the environment of spawned tasks.
+
+#### Webhook (optional)
+
+Instead of polling, Telegram can push updates to isidore. This needs a public
+HTTPS endpoint (valid certificate, port 443, 80, 88 or 8443) that forwards to
+isidore's `POST /telegram/webhook`. Since isidore listens on loopback only, put
+a reverse proxy in front and expose **only that path**, e.g. with Caddy:
+
+```caddyfile
+bot.example.com {
+	handle /telegram/webhook {
+		reverse_proxy 127.0.0.1:8920
+	}
+	respond 404
+}
+```
+
+Then set the public URL and recreate the container:
+
+```sh
+ISIDORE_TELEGRAM_WEBHOOK_URL=https://bot.example.com/telegram/webhook
+```
+
+At startup isidore calls `setWebhook` with that URL and a secret derived from
+the bot token; Telegram echoes it in `X-Telegram-Bot-Api-Secret-Token` and
+isidore rejects requests without it (401). This route ignores `ISIDORE_TOKEN`
+and returns 404 when no webhook URL is set. `/api/info` reports
+`"telegram_mode": "webhook"`; `getWebhookInfo` on the Bot API shows delivery
+errors. Unset the variable to go back to polling (the webhook is deleted on the
+next start).
+
+See [isidore/README.md](isidore/README.md#telegram).
 
 ## Scheduler (schedule tasks)
 

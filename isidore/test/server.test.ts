@@ -25,6 +25,8 @@ function settingsFor(dir: string): Settings {
     schedulerToken: null,
     telegramToken: null,
     telegramChats: new Set(),
+    telegramWebhookUrl: null,
+    telegramWebhookSecret: null,
   };
 }
 
@@ -58,6 +60,10 @@ test("serves the UI, API and runs a task end to end", async () => {
     const info = await app.inject({ method: "GET", url: "/api/info" });
     assert.equal(info.statusCode, 200);
     assert.equal(info.json().scheduler, false);
+    assert.equal(info.json().telegram_mode, null);
+
+    const webhook = await app.inject({ method: "POST", url: "/telegram/webhook", payload: {} });
+    assert.equal(webhook.statusCode, 404);
     assert.equal(info.json().max_workers, 2);
 
     const empty = await app.inject({ method: "POST", url: "/api/tasks", payload: { prompt: "" } });

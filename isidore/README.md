@@ -76,10 +76,19 @@ proxy for remote access.
 1. Create a bot with [@BotFather](https://t.me/BotFather) and copy the token.
 2. Send the bot a message, then find your chat id (e.g. with
    `https://api.telegram.org/bot<token>/getUpdates`).
-3. Set `ISIDORE_TELEGRAM_TOKEN` and `ISIDORE_TELEGRAM_CHATS` (comma-separated
-   chat ids) in the environment used by `docker compose`.
+3. Write the token to a 0600 file and set `ISIDORE_TELEGRAM_TOKEN_FILE` (its
+   path) and `ISIDORE_TELEGRAM_CHATS` (comma-separated chat ids) in the
+   environment used by `docker compose`. Compose mounts the file as the
+   `telegram` secret; outside compose, `ISIDORE_TELEGRAM_TOKEN` (the token
+   itself) also works.
 
-The bot long-polls, so no public webhook is needed. An empty allow-list denies
+By default the bot long-polls, so no public endpoint is needed (any leftover
+webhook is deleted at startup). With `ISIDORE_TELEGRAM_WEBHOOK_URL` set, it
+calls `setWebhook` instead and receives updates on `POST /telegram/webhook`,
+which a reverse proxy must expose at that public HTTPS URL. That route is
+authenticated by Telegram's `X-Telegram-Bot-Api-Secret-Token` header, not by
+`ISIDORE_TOKEN`; the secret defaults to an HMAC of the bot token
+(override with `ISIDORE_TELEGRAM_WEBHOOK_SECRET[_FILE]`). An empty allow-list denies
 everyone. Commands: `/new <prompt>` (plain text also works), `/list`,
 `/status <id>`, `/cancel <id>`, `/help`. The originating chat is notified when
 a task finishes.
@@ -99,8 +108,11 @@ a task finishes.
 | `ISIDORE_TOKEN` | none | bearer token for the API/UI |
 | `ISIDORE_SCHEDULER_URL` | none | enables the schedule form |
 | `ISIDORE_SCHEDULER_TOKEN` | none | bearer token for the scheduler |
-| `ISIDORE_TELEGRAM_TOKEN` | none | enables the bot |
+| `ISIDORE_TELEGRAM_TOKEN` | none | bot token; enables the bot |
+| `ISIDORE_TELEGRAM_TOKEN_FILE` | none | file holding the token, used when `ISIDORE_TELEGRAM_TOKEN` is unset |
 | `ISIDORE_TELEGRAM_CHATS` | empty | allowed chat ids |
+| `ISIDORE_TELEGRAM_WEBHOOK_URL` | none | public HTTPS URL for webhook mode; unset = long polling |
+| `ISIDORE_TELEGRAM_WEBHOOK_SECRET` (`_FILE`) | HMAC of the bot token | webhook secret token (`[A-Za-z0-9_-]`, ≤256 chars) |
 
 ## Development
 

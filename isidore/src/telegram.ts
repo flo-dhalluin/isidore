@@ -1,3 +1,4 @@
+import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Runner } from "./runner.ts";
 import type { Task, TaskStore } from "./store.ts";
 
@@ -9,7 +10,26 @@ function chunks(text: string, size = MAX_MESSAGE): string[] {
   return result.length ? result : [""];
 }
 
-/** Optional Telegram front-end. Disabled unless a token is configured. */
+export interface TelegramOptions {
+  apiBase?: string;
+  /** Long-poll timeout in seconds (polling mode). */
+  pollTimeout?: number;
+  /** Public HTTPS URL Telegram posts updates to; null = long polling. */
+  webhookUrl?: string | null;
+  /** Value Telegram echoes in `X-Telegram-Bot-Api-Secret-Token`. */
+  webhookSecret?: string | null;
+}
+
+/** Derive a webhook secret from the bot token: [A-Za-z0-9_-], stable across restarts. */
+export function deriveWebhookSecret(token: string): string {
+  return createHmac("sha256", token).update("isidore-telegram-webhook").digest("hex");
+}
+
+/**
+ * Optional Telegram front-end. Disabled unless a token is configured.
+ * Receives updates by long polling (default) or, when a webhook URL is set,
+ * through `handleWebhook` (wired to `POST /telegram/webhook` by the server).
+ */
 export class TelegramBot {
   private readonly token: string;
   private readonly runner: Runner;
@@ -17,26 +37,65 @@ export class TelegramBot {
   private readonly allowedChats: Set<string>;
   private readonly apiBase: string;
   private readonly pollTimeout: number;
+  readonly webhookUrl: string | null;
+  private readonly webhookSecret: string;
   private offset = 0;
   private stopped = false;
 
-  constructor(
-    token: string,
-    runner: Runner,
-    store: TaskStore,
-    allowedChats: Set<string>,
-    apiBase = "https://api.telegram.org",
-    pollTimeout = 30,
-  ) {
+  constructor(token: string, runner: Runner, store: TaskStore, allowedChats: Set<string>, options: TelegramOptions = {}) {
     this.token = token;
     this.runner = runner;
     this.store = store;
     this.allowedChats = allowedChats;
-    this.apiBase = apiBase.replace(/\/+$/, "");
-    this.pollTimeout = pollTimeout;
+    this.apiBase = (options.apiBase ?? "https://api.telegram.org").replace(/\/+$/, "");
+    this.pollTimeout = options.pollTimeout ?? 30;
+    this.webhookUrl = options.webhookUrl || null;
+    this.webhookSecret = options.webhookSecret || deriveWebhookSecret(token);
   }
 
+  get mode(): "webhook" | "polling" {
+    return this.webhookUrl ? "webhook" : "polling";
+  }
+
+  /** Register the webhook, or clear it and long-poll. Retries until it succeeds or the bot stops. */
   async run(): Promise<void> {
+    while (!this.stopped) {
+      try {
+        if (this.webhookUrl) {
+          await this.call("setWebhook", {
+            url: this.webhookUrl,
+            secret_token: this.webhookSecret,
+            allowed_updates: ["message"],
+          });
+          return;
+        }
+        // getUpdates is refused while a webhook is set (e.g. from a previous run).
+        await this.call("deleteWebhook", {});
+        break;
+      } catch (error) {
+        console.error(`telegram: ${this.mode} setup failed: ${String(error)}`);
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+      }
+    }
+    await this.poll();
+  }
+
+  /** Handle a webhook request. Returns false when the secret header does not match. */
+  handleWebhook(secretHeader: string | string[] | undefined, update: unknown): boolean {
+    const given = Buffer.from(typeof secretHeader === "string" ? secretHeader : "");
+    const expected = Buffer.from(this.webhookSecret);
+    if (given.length !== expected.length || !timingSafeEqual(given, expected)) return false;
+    if (!update || typeof update !== "object") return true;
+    const record = update as Record<string, unknown>;
+    const id = Number(record.update_id ?? 0);
+    // Telegram retries deliveries it considers failed; skip ones already seen.
+    if (id && id < this.offset) return true;
+    if (id) this.offset = id + 1;
+    void this.handle(record).catch(() => {});
+    return true;
+  }
+
+  private async poll(): Promise<void> {
     while (!this.stopped) {
       try {
         for (const update of await this.getUpdates()) {
@@ -50,6 +109,17 @@ export class TelegramBot {
         await new Promise((resolve) => setTimeout(resolve, 5000));
       }
     }
+  }
+
+  private async call(method: string, body: Record<string, unknown>): Promise<unknown> {
+    const response = await fetch(`${this.apiBase}/bot${this.token}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = (await response.json()) as { ok?: boolean; description?: string; result?: unknown };
+    if (!data.ok) throw new Error(`${method}: ${data.description ?? response.status}`);
+    return data.result;
   }
 
   async stop(): Promise<void> {

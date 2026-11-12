@@ -38,7 +38,10 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
   });
 
   if (settings.telegramToken) {
-    bot = new TelegramBot(settings.telegramToken, runner, store, settings.telegramChats);
+    bot = new TelegramBot(settings.telegramToken, runner, store, settings.telegramChats, {
+      webhookUrl: settings.telegramWebhookUrl,
+      webhookSecret: settings.telegramWebhookSecret,
+    });
     void bot.run();
   }
 
@@ -54,6 +57,15 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
     return reply.type("text/html").send(renderTemplate("task.html"));
   });
 
+  // Telegram webhook: authenticated by the secret token Telegram echoes back,
+  // not by ISIDORE_TOKEN, so a reverse proxy can expose just this path.
+  app.post("/telegram/webhook", async (request, reply) => {
+    if (!bot?.webhookUrl) return reply.code(404).send({ error: "not found" });
+    const ok = bot.handleWebhook(request.headers["x-telegram-bot-api-secret-token"], request.body);
+    if (!ok) return reply.code(401).send({ error: "unauthorised" });
+    return reply.code(200).send({ ok: true });
+  });
+
   app.get("/healthz", async () => ({ ok: true, tasks: store.count() }));
 
   app.get("/api/info", async (request, reply) => {
@@ -63,6 +75,7 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
       model: settings.model,
       max_workers: settings.maxWorkers,
       telegram: Boolean(settings.telegramToken),
+      telegram_mode: bot?.mode ?? null,
     };
   });
 

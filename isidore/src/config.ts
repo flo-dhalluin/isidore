@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 export interface Settings {
@@ -16,6 +17,8 @@ export interface Settings {
   schedulerToken: string | null;
   telegramToken: string | null;
   telegramChats: Set<string>;
+  telegramWebhookUrl: string | null;
+  telegramWebhookSecret: string | null;
 }
 
 function envInt(name: string, fallback: number): number {
@@ -30,6 +33,19 @@ function envFloat(name: string, fallback: number | null): number | null {
   if (value === undefined || value === "") return fallback;
   const parsed = Number.parseFloat(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+/** A secret from `NAME`, or else from the file named by `NAME_FILE` (compose secret). */
+function envSecret(name: string): string | null {
+  const value = process.env[name];
+  if (value) return value;
+  const file = process.env[`${name}_FILE`];
+  if (!file) return null;
+  try {
+    return readFileSync(file, "utf8").trim() || null;
+  } catch {
+    return null;
+  }
 }
 
 export function loadSettings(): Settings {
@@ -51,13 +67,15 @@ export function loadSettings(): Settings {
     maxOutput: envInt("ISIDORE_MAX_OUTPUT", 200_000),
     schedulerUrl: process.env.ISIDORE_SCHEDULER_URL || null,
     schedulerToken: process.env.ISIDORE_SCHEDULER_TOKEN || null,
-    telegramToken: process.env.ISIDORE_TELEGRAM_TOKEN || null,
+    telegramToken: envSecret("ISIDORE_TELEGRAM_TOKEN"),
     telegramChats: new Set(
       (process.env.ISIDORE_TELEGRAM_CHATS ?? "")
         .split(",")
         .map((chat) => chat.trim())
         .filter(Boolean),
     ),
+    telegramWebhookUrl: process.env.ISIDORE_TELEGRAM_WEBHOOK_URL || null,
+    telegramWebhookSecret: envSecret("ISIDORE_TELEGRAM_WEBHOOK_SECRET"),
   };
 }
 
