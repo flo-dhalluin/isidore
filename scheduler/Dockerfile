@@ -26,6 +26,11 @@ ENV PATH=/opt/scheduler/.venv/bin:$PATH \
     SCHEDULER_HOST=0.0.0.0 \
     SCHEDULER_PORT=8940
 
+# Pre-create the shared-volume mountpoints owned by the runtime user so a
+# fresh named volume (scheduler-auth, mounted rw at /shared) inherits
+# uid-1000 ownership and the generated admin token can be written.
+RUN mkdir -p /shared /isidore-shared && chown 1000:1000 /shared /isidore-shared
+
 EXPOSE 8940
 USER app
 CMD ["scheduler"]

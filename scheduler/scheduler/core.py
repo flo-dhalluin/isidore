@@ -116,6 +116,10 @@ class Schedule:
     reply_to: str | None = None
     last_task_id: str | None = None
     last_error: str | None = None
+    # Conversation (root task id) that created this schedule, used to scope MCP
+    # tool calls and admin REST requests carrying X-Isidore-Conversation-Id.
+    # Additive: legacy records load as None and are invisible to task tokens.
+    conversation_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

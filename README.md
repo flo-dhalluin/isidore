@@ -35,7 +35,17 @@ docker compose up -d --build
 Or copy [`.env.example`](.env.example) to `.env` and edit it, then just
 `docker compose up -d --build`.
 
-Open <http://127.0.0.1:8920/> (isidore's web UI). `docker compose logs -f`
+Open <http://127.0.0.1:8920/> (isidore's web UI). The UI/API require an admin
+token. If you did not set `ISIDORE_TOKEN`, isidore generates one at startup;
+retrieve it out-of-band and pass it as a query parameter:
+
+```sh
+docker compose exec isidore cat /state/shared/admin-token   # or: docker compose logs isidore
+# then open http://127.0.0.1:8920/?token=<TOKEN>
+```
+
+The token is never injected into the loopback page itself: tasks share
+isidore's network namespace and could harvest it. `docker compose logs -f`
 follows the logs; `docker compose down` stops and removes the containers.
 
 The services run as `PI_UID:PI_GID` (default `1000:1000`). If your account is not
@@ -61,13 +71,13 @@ Compose reads these from the environment (or a `.env` file beside
 | `ISIDORE_STATE` | `~/.local/state/pi-sandbox/isidore` | tasks, workspaces, shared Pi config |
 | `SCHEDULER_STATE` | `~/.local/state/pi-sandbox/scheduler` | `schedules.json` |
 | `ISIDORE_PORT` | `8920` | host port for the web UI (bound to loopback) |
-| `ISIDORE_TOKEN` | none | bearer token for the isidore API/UI |
+| `ISIDORE_TOKEN` | generated | admin bearer token for the isidore API/UI; generated at startup when unset (see [isidore/README.md](isidore/README.md#authentication)) |
 | `ISIDORE_MAX_WORKERS` | `2` | concurrent tasks |
 | `ISIDORE_TASK_TIMEOUT` | none | seconds before a task is killed |
 | `ISIDORE_TELEGRAM_TOKEN_FILE` | `/dev/null` | file holding the Telegram bot token (compose secret); enables the bot |
 | `ISIDORE_TELEGRAM_CHATS` | empty | allowed Telegram chat ids |
 | `ISIDORE_TELEGRAM_WEBHOOK_URL` | none | public HTTPS URL for Telegram webhooks; unset = long polling |
-| `SCHEDULER_TOKEN` | none | bearer token for the scheduler |
+| `SCHEDULER_TOKEN` | generated | admin bearer token for the scheduler REST API; generated at startup when unset (`docker compose exec scheduler cat /shared/scheduler-token`, or the startup log). isidore reads it automatically via the `scheduler-auth` volume |
 | `BROWSER_MCP_ALLOW_JS` | `0` | expose `browser_evaluate` (arbitrary JS) |
 | `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL` | `pi-sandbox` / `pi-sandbox@localhost` | git identity inside tasks |
 
@@ -109,10 +119,15 @@ process group on cancel or timeout. The UI is one minimalist HTML page at
 
 ```sh
 docker compose up -d                   # isidore, scheduler and browser
-open http://127.0.0.1:8920/            # or curl -X POST localhost:8920/api/tasks \
-                                       #   -H 'content-type: application/json' \
-                                       #   -d '{"prompt":"list the files here"}'
+TOKEN=$(docker compose exec -T isidore cat /state/shared/admin-token)
+open "http://127.0.0.1:8920/?token=$TOKEN"
+# or curl -X POST localhost:8920/api/tasks \
+#   -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+#   -d '{"prompt":"list the files here"}'
 ```
+
+The API/UI accept the admin token (above) or a per-task capability token scoped
+to one conversation; see [isidore/README.md](isidore/README.md#authentication).
 
 ### Telegram
 

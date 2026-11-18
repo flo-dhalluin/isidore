@@ -60,6 +60,10 @@ export function utcnow(): string {
 export const newId = (prefix = "t"): string => `${prefix}_${randomBytes(6).toString("hex")}`;
 export const rootId = (task: Task): string => task.thread_id ?? task.id;
 export const isDone = (task: Task): boolean => TERMINAL_STATUSES.has(task.status);
+// Invariant: a Task (and therefore publicTask) must NEVER carry token material.
+// Per-task capability tokens live only in the in-memory TokenRegistry (as a
+// SHA-256 hash) and in the worker's ISIDORE_TASK_TOKEN env var — never in the
+// persisted task JSON or any API response.
 export const publicTask = (task: Task): PublicTask => ({ ...task, done: isDone(task) });
 
 export function createTask(prompt: string, overrides: Partial<Task> = {}): Task {

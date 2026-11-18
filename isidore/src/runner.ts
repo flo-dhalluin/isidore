@@ -1,7 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { createTask, isDone, rootId, type Task, type TaskStore, utcnow } from "./store.ts";
+import { TokenRegistry } from "./tokens.ts";
 
 const MAX_EVENT_TEXT = 4_000;
 
@@ -16,16 +17,135 @@ export interface RunnerOptions {
   mode: "print" | "json";
   baseEnv?: NodeJS.ProcessEnv;
   onChange?: (task: Task) => void | Promise<void>;
+  /** Per-task capability tokens; minted at spawn, revoked at finalise (Worker A). */
+  tokens?: TokenRegistry;
+  /** Landlock launcher binary; missing => fail closed unless unsafeNoSandbox (Worker A). */
+  sandboxBin?: string | null;
+  /** Run workers without the launcher; logged loudly (Worker A). */
+  unsafeNoSandbox?: boolean;
+  /** Shared Pi agent dir; defaults to baseEnv.PI_CODING_AGENT_DIR ?? "/state/pi" (Worker A). */
+  agentDir?: string;
 }
 
 export interface WorkerRequest {
   prompt: string;
   model: string | null;
   sessionId: string;
+  /**
+   * OpenRouter key, delivered via stdin instead of the exec environment:
+   * /proc/self/environ reflects the EXEC-time env, so a key passed in env
+   * would stay readable by in-worker tools even after the worker deletes it
+   * from process.env. Additive field; the JSONL output contract is untouched.
+   */
+  apiKey?: string | null;
 }
 
-export function buildWorkerRequest(task: Task, model: string | null): WorkerRequest {
-  return { prompt: task.prompt, model: task.model ?? model, sessionId: rootId(task) };
+export function buildWorkerRequest(task: Task, model: string | null, apiKey: string | null = null): WorkerRequest {
+  return { prompt: task.prompt, model: task.model ?? model, sessionId: rootId(task), apiKey };
+}
+
+/**
+ * Landlock allow-list for a task worker (deny everything else).
+ *
+ * `agentDirTargets` are the resolved targets of the per-task `.pi` symlinks
+ * (Landlock checks symlink targets, not the links themselves).
+ *
+ * /proc is deliberately NARROW, not a wholesale --ro /proc: Landlock has no
+ * ptrace scope (the kernel only scopes abstract unix sockets and signals,
+ * ABI 6), so a broad /proc rule would leave /proc/<other-pid>/environ and
+ * /proc/<other-pid>/mem readable (same uid; Yama cannot be relied on in
+ * containers, and tasks are descendants of the service, which Yama scope 1
+ * would ALLOW to ptrace it). Landlock cannot deny single files under an
+ * allowed hierarchy, and per-child /proc/<pid> rules cannot be added
+ * statically. Instead we allow:
+ *  - /proc/self: resolved to the launcher's pid dir BEFORE exec; execv keeps
+ *    the pid, so the worker itself keeps full access to its own /proc files.
+ *  - global, non-sensitive proc files that node/libuv/git need.
+ * Cross-pid environ/mem reads are denied by Landlock itself (tested).
+ *
+ * DECISION (empirically verified on kernel 7.1 / ABI 9, see sandbox.test.ts
+ * case 5): child processes have different pids, so their /proc/self resolves
+ * outside the allow-list and reads fail. We ACCEPT this breakage because
+ * real workloads still work: the node worker itself (exec keeps the pid)
+ * reads /proc/self fine (memoryUsage, cmdline), git init/add/commit/status/
+ * log all succeed, and bash runs normal commands (process substitution uses
+ * pipe fds, not proc paths). Known residual: explicit /proc/self reads in
+ * CHILDREN fail, and process.memoryUsage() in node CHILD processes throws
+ * EACCES (uv_resident_set_memory). The alternative (--ro /proc wholesale)
+ * would leak the service's environ to every task — unacceptable.
+ */
+export function buildSandboxArgs(workspace: string, agentDirTargets: string[]): string[] {
+  const args: string[] = ["--rw", workspace];
+  for (const path of ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/opt/isidore"]) {
+    args.push("--rx", path);
+  }
+  for (const path of [
+    "/proc/self",
+    "/proc/meminfo",
+    "/proc/cpuinfo",
+    "/proc/stat",
+    "/proc/version",
+    "/proc/uptime",
+    "/proc/loadavg",
+    "/proc/filesystems",
+    "/proc/mounts",
+    "/proc/sys",
+    "/sys",
+  ]) {
+    args.push("--ro", path);
+  }
+  for (const target of agentDirTargets) args.push("--ro", target);
+  for (const path of ["/dev/null", "/dev/urandom", "/dev/zero", "/dev/tty"]) {
+    args.push("--rw", path);
+  }
+  return args;
+}
+
+/** Shared agent-dir entries a task must never see (secrets, other sessions, state). */
+const AGENT_DIR_DENYLIST = new Set(["auth.json", "sessions", "web-search-cache", ".seed", "tmp"]);
+/** Small config files copied per task (writable); everything else is symlinked read-only. */
+const AGENT_DIR_COPIES = new Set(["models.json", "mcp.json", "settings.json"]);
+
+/**
+ * Build the per-task agent dir `<workspace>/.pi` from the shared Pi dir.
+ * Returns the symlink TARGETS (under the shared dir) for the Landlock --ro
+ * rules. Idempotent: copies are refreshed and symlinks re-pointed on every
+ * call, so followups pick up shared-config changes.
+ */
+export function prepareAgentDir(workspace: string, sharedAgentDir: string): string[] {
+  const dir = join(workspace, ".pi");
+  mkdirSync(dir, { recursive: true });
+  // Pi writes search results here at runtime; give each task its own.
+  mkdirSync(join(dir, "web-search-cache"), { recursive: true });
+  const targets: string[] = [];
+  let entries;
+  try {
+    entries = readdirSync(sharedAgentDir, { withFileTypes: true });
+  } catch {
+    return targets; // no shared dir (bare dev setup): nothing to link
+  }
+  for (const entry of entries) {
+    const name = entry.name;
+    if (AGENT_DIR_DENYLIST.has(name) || name.endsWith(".lock")) continue;
+    const source = join(sharedAgentDir, name);
+    const dest = join(dir, name);
+    if (AGENT_DIR_COPIES.has(name)) {
+      if (entry.isFile()) copyFileSync(source, dest);
+      continue;
+    }
+    // Symlink everything else (npm/, extensions/, themes/, ...). Refresh on
+    // followups: replace whatever is there (except a correct existing link).
+    // The target always needs a --ro rule, even when the link already exists.
+    targets.push(source);
+    try {
+      if (realpathSync(dest) === realpathSync(source)) continue;
+    } catch {
+      // dest or source missing: fall through and (re)create the link
+    }
+    rmSync(dest, { recursive: true, force: true });
+    symlinkSync(source, dest);
+  }
+  return targets;
 }
 
 /** Flatten a Pi message `content` value into plain text. */
@@ -84,6 +204,10 @@ export class Runner {
   private readonly mode: "print" | "json";
   private readonly baseEnv: NodeJS.ProcessEnv;
   private readonly onChange?: (task: Task) => void | Promise<void>;
+  private readonly tokens: TokenRegistry;
+  private readonly sandboxBin: string | null;
+  private readonly unsafeNoSandbox: boolean;
+  private readonly agentDir: string;
   private readonly procs = new Map<string, ChildProcess>();
   private readonly jobs = new Set<Promise<void>>();
   private active = 0;
@@ -101,6 +225,21 @@ export class Runner {
     this.mode = options.mode;
     this.baseEnv = options.baseEnv ?? process.env;
     this.onChange = options.onChange;
+    this.tokens = options.tokens ?? new TokenRegistry();
+    this.sandboxBin = options.sandboxBin ?? null;
+    this.unsafeNoSandbox = options.unsafeNoSandbox ?? false;
+    this.agentDir = options.agentDir ?? this.baseEnv.PI_CODING_AGENT_DIR ?? "/state/pi";
+    if (this.unsafeNoSandbox) {
+      console.error("======================================================================");
+      console.error("isidore: ISIDORE_UNSAFE_NO_SANDBOX=1 — workers run WITHOUT the");
+      console.error("isidore: Landlock launcher. Tasks can read/write the whole state");
+      console.error("isidore: dir, secrets and other tasks' data. NEVER use in production.");
+      console.error("======================================================================");
+    } else if (!this.sandboxBin || !existsSync(this.sandboxBin)) {
+      console.error(
+        `isidore: sandbox binary ${this.sandboxBin ?? "(unset)"} not found — tasks will FAIL CLOSED until it exists (or ISIDORE_UNSAFE_NO_SANDBOX=1).`,
+      );
+    }
   }
 
   submit(task: Task): Task {
@@ -157,12 +296,18 @@ export class Runner {
     // Keep this conversation's Pi session inside its workspace.
     env.PI_CODING_AGENT_SESSION_DIR = join(workspace, "sessions");
     mkdirSync(env.PI_CODING_AGENT_SESSION_DIR, { recursive: true });
-    // Do not hand the service's own credentials to the agent.
+    // Do not hand the service's own credentials to the agent. OPENROUTER_API_KEY
+    // is removed here too: /proc/self/environ reflects the EXEC-time env, so
+    // deleting it inside the worker would be too late — the key travels to the
+    // worker via the stdin JSON request (WorkerRequest.apiKey) instead.
     for (const key of Object.keys(env)) {
       if (key.startsWith("ISIDORE_") || key.startsWith("SCHEDULER_") || key.startsWith("PI_SANDBOX_")) {
         delete env[key];
       }
     }
+    delete env.OPENROUTER_API_KEY;
+    // Per-task agent dir (copies of models/mcp/settings, symlinks to the rest).
+    env.PI_CODING_AGENT_DIR = join(workspace, ".pi");
     // The per-task HOME has no git config; mirror the author identity.
     for (const key of ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL"]) {
       if (env[key]) env[key.replace("AUTHOR", "COMMITTER")] ??= env[key];
@@ -214,20 +359,60 @@ export class Runner {
     this.store.update(task);
     this.notify(task);
 
-    const request = buildWorkerRequest(task, this.model);
+    const request = buildWorkerRequest(task, this.model, this.baseEnv.OPENROUTER_API_KEY ?? null);
     // In dev the worker is TypeScript; Node runs it with type stripping.
     const workerArgs = this.workerScript.endsWith(".ts")
       ? ["--experimental-strip-types", this.workerScript]
       : [this.workerScript];
-    const proc = spawn(this.workerBin, workerArgs, {
-      cwd: workspace,
-      // The task's origin, interpolated into the scheduler MCP headers
-      // (X-Isidore-Origin) so schedules it creates can report back to it.
-      env: { ...this.env(workspace), ISIDORE_TASK_ORIGIN: task.origin || "web" },
-      stdio: ["pipe", "pipe", "pipe"],
-      // Own process group: cancelling a task kills its whole tree.
-      detached: true,
-    });
+    // Per-task capability token: minted at spawn, revoked in finalise() — or
+    // immediately below if anything before/including spawn throws, so a
+    // fail-closed task never leaks a live token into the registry.
+    // Set AFTER the prefix scrub so it survives into the worker env (Pi
+    // expands it into the scheduler MCP headers); bash children never see it.
+    const token = this.tokens.issue(task);
+    let proc: ChildProcess;
+    try {
+      const env: NodeJS.ProcessEnv = {
+        ...this.env(workspace),
+        ISIDORE_TASK_ORIGIN: task.origin || "web",
+        ISIDORE_TASK_TOKEN: token,
+      };
+      let bin = this.workerBin;
+      let args = workerArgs;
+      if (!this.unsafeNoSandbox) {
+        if (!this.sandboxBin || !existsSync(this.sandboxBin)) {
+          throw new Error(
+            `sandbox binary not found: ${this.sandboxBin ?? "(unset)"} — refusing to run unsandboxed (set ISIDORE_SANDBOX_BIN, or ISIDORE_UNSAFE_NO_SANDBOX=1 to override)`,
+          );
+        }
+        const targets = prepareAgentDir(workspace, this.agentDir);
+        bin = this.sandboxBin;
+        args = [
+          ...buildSandboxArgs(workspace, targets),
+          // The worker script itself must be readable/executable (in production
+          // this is /opt/isidore/dist, already covered; in tests it is a tmpdir).
+          // NOTE: this grants read to the WHOLE script directory, so never
+          // co-locate secrets with the worker script in dev/test layouts.
+          "--rx",
+          dirname(this.workerScript),
+          "--",
+          this.workerBin,
+          ...workerArgs,
+        ];
+      }
+      proc = spawn(bin, args, {
+        cwd: workspace,
+        // The task's origin, interpolated into the scheduler MCP headers
+        // (X-Isidore-Origin) so schedules it creates can report back to it.
+        env,
+        stdio: ["pipe", "pipe", "pipe"],
+        // Own process group: cancelling a task kills its whole tree.
+        detached: true,
+      });
+    } catch (error) {
+      this.tokens.revoke(task.id);
+      throw error;
+    }
     this.procs.set(task.id, proc);
     proc.stdin?.on("error", () => undefined);
     proc.stdin?.end(JSON.stringify(request));
@@ -352,6 +537,7 @@ export class Runner {
   }
 
   private finalise(task: Task, exitCode: number | null, timedOut: boolean): void {
+    this.tokens.revoke(task.id);
     task.exit_code = exitCode;
     if (!task.finished_at) task.finished_at = utcnow();
     if (task.status === "cancelled") {

@@ -16,5 +16,8 @@ node_modules/
 # Test helpers (fake executables must live on an exec-capable mount)
 .isidore-test-bin-*
 
+# Compiled sandbox launcher (built by `make -C isidore/sandbox`, npm pretest, Dockerfile)
+isidore/sandbox/isidore-sandbox
+
 # Local environment / secrets; see .env.example
 .env
