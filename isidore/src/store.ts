@@ -36,6 +36,15 @@ export interface Task {
   schedule_id: string | null;
   parent_id: string | null;
   thread_id: string | null;
+  /**
+   * Lineage (Phase 3): the parent conversation this task was spawned from
+   * (admin/scheduler POST /api/tasks with conversation_id). The child keeps
+   * its OWN root/workspace (parent_id/thread_id stay null); only the tools
+   * are inherited, pinned at spawn in inherited_tools.
+   */
+  inherited_from: string | null;
+  /** Pinned {id,version} snapshot of the parent conversation's active tools at spawn. */
+  inherited_tools: Array<{ id: string; version: number }> | null;
   workspace: string | null;
   tool_calls: ToolCall[];
 }
@@ -82,6 +91,8 @@ export function createTask(prompt: string, overrides: Partial<Task> = {}): Task 
     schedule_id: null,
     parent_id: null,
     thread_id: null,
+    inherited_from: null,
+    inherited_tools: null,
     workspace: null,
     tool_calls: [],
     ...overrides,
@@ -103,6 +114,8 @@ const KNOWN_FIELDS: ReadonlySet<string> = new Set([
   "schedule_id",
   "parent_id",
   "thread_id",
+  "inherited_from",
+  "inherited_tools",
   "workspace",
   "tool_calls",
 ]);

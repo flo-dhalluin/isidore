@@ -15,14 +15,22 @@
  *    through DefaultResourceLoader.additionalExtensionPaths, not here. The
  *    informational builtin entries (no extension.entry) are skipped.
  *
- * registerCommandTool is exported for reuse by the Phase 3 same-turn hook.
+ * Same-turn liveness (Phase 3): a tool_result hook watches the tools authoring
+ * MCP (server "tools" -> mcp__tools__tool_*). A successful tool_create /
+ * tool_update registers the new command tool / MCP server synchronously in
+ * the hook, BEFORE the result reaches the model — including nested codemode
+ * calls (tool_result fires for those too, with parentToolCallId set).
+ * tool_disable / tool_remove unregister MCP servers or replace command tools
+ * with an error stub (Pi has no unregisterTool).
+ *
+ * registerCommandTool is exported for reuse by the same-turn hook.
  */
 
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import type { AgentToolResult, ExtensionAPI, ExtensionFactory, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, ExtensionFactory, ToolDefinition, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import { scrubEnv } from "./env-scrub.ts";
 import { DEFAULT_COMMAND_TIMEOUT_S, MAX_COMMAND_TIMEOUT_S, MAX_EVENT_TEXT } from "./limits.ts";
 import type { ResolvedTool, ToolManifest } from "./tools.ts";
@@ -255,17 +263,148 @@ export function registerCommandTool(pi: ExtensionAPI, manifest: ToolManifest, ca
  */
 export function createRegistryExtension(options: RegistryExtensionOptions): ExtensionFactory {
   return (pi) => {
-    for (const tool of options.tools) {
-      const manifest = tool.manifest;
-      if (manifest.status !== "active") continue;
+    // name -> fingerprint of the live registration, guarding duplicate
+    // registration (a repeated tool_result, or an unchanged mcp config).
+    const live = new Map<string, string>();
+
+    const registerManifest = (manifest: ToolManifest, cachePath: string | null): void => {
+      if (manifest.status !== "active") return;
       if (manifest.kind === "mcp") {
-        if (!manifest.mcp) continue;
-        pi.registerMcpServer(manifest.name, mcpConfig(manifest));
+        if (!manifest.mcp) return;
+        const config = mcpConfig(manifest);
+        const fingerprint = `mcp:${JSON.stringify(config)}`;
+        if (live.get(manifest.name) === fingerprint) return;
+        // Re-registering a name replaces this extension's earlier registration
+        // (verified against the pinned SDK), so updates reconnect cleanly.
+        pi.registerMcpServer(manifest.name, config);
+        live.set(manifest.name, fingerprint);
       } else if (manifest.kind === "command") {
-        registerCommandTool(pi, manifest, tool.cachePath, options.cwd);
+        const fingerprint = `command:${manifest.id}@${manifest.version}`;
+        if (live.get(manifest.name) === fingerprint) return;
+        registerCommandTool(pi, manifest, cachePath, options.cwd);
+        live.set(manifest.name, fingerprint);
       }
       // extension kind: human-only modules loaded via additionalExtensionPaths
       // in the worker; informational builtins (no extension.entry) are skipped.
+    };
+
+    // One failing registration must not drop the whole tool set: e.g. an MCP
+    // namespace clash (names differing only in -/_) makes pi.registerMcpServer
+    // throw. Authoring rejects such clashes, but inherited pins or records
+    // edited outside the authoring path could still carry one — log to stderr,
+    // skip the failing tool, keep registering the rest.
+    const safeRegister = (manifest: ToolManifest, cachePath: string | null): void => {
+      try {
+        registerManifest(manifest, cachePath);
+      } catch (error) {
+        console.error(
+          `isidore: registry extension: skipping tool "${manifest.name}" (${manifest.id}): ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    };
+
+    for (const tool of options.tools) {
+      safeRegister(tool.manifest, tool.cachePath);
     }
+
+    pi.on("tool_result", (event) => {
+      const operation = toolsMcpOperation(event.toolName);
+      if (!operation || event.isError) return;
+      const payload = authoringPayload(event);
+      if (!payload) return;
+      if (operation === "tool_create" || operation === "tool_update") {
+        const manifest = payload.manifest as ToolManifest | undefined;
+        if (!manifest || typeof manifest.name !== "string" || typeof manifest.kind !== "string") return;
+        const cachePath = typeof payload.cachePath === "string" ? payload.cachePath : null;
+        safeRegister(manifest, cachePath);
+        return;
+      }
+      // tool_disable / tool_remove: take the tool out of the live session.
+      const name = payload.name;
+      if (typeof name !== "string") return;
+      if (payload.kind === "mcp") {
+        if (live.has(name)) {
+          pi.unregisterMcpServer(name);
+          live.delete(name);
+        }
+      } else if (payload.kind === "command") {
+        // No unregisterTool in Pi: replace with a same-name error stub.
+        registerDisabledToolStub(pi, name, operation === "tool_remove" ? "removed" : "disabled");
+        live.set(name, "stub");
+      }
+    });
   };
+}
+
+/**
+ * The tools authoring MCP is registered under the server name "tools"
+ * (builtin:tools); Pi names its tools mcp__<server>__<tool> (verified against
+ * the pinned SDK's createMcpToolName; both parts are already identifier-safe).
+ */
+const TOOLS_MCP_OPERATIONS: ReadonlySet<string> = new Set([
+  "mcp__tools__tool_create",
+  "mcp__tools__tool_update",
+  "mcp__tools__tool_disable",
+  "mcp__tools__tool_remove",
+]);
+
+function toolsMcpOperation(toolName: string): string | null {
+  if (!TOOLS_MCP_OPERATIONS.has(toolName)) return null;
+  return toolName.slice("mcp__tools__".length);
+}
+
+/**
+ * Extract the authoring payload ({manifest,cachePath} or {id,name,kind,...})
+ * from a tool_result event. Verified against the pinned SDK: for MCP tools,
+ * event.structuredContent is the WHOLE CallToolResult, so the server's
+ * structuredContent sits one level down at .structuredContent.structuredContent.
+ * Fallbacks: a direct structuredContent payload, then JSON-parsed text blocks
+ * (event.content or the CallToolResult's content) in case structured content
+ * ever fails to survive the pipeline.
+ */
+function authoringPayload(event: ToolResultEvent): Record<string, unknown> | null {
+  const isPayload = (value: unknown): value is Record<string, unknown> =>
+    value !== null && typeof value === "object" && !Array.isArray(value) && ("manifest" in value || "name" in value);
+  const candidates: unknown[] = [];
+  const structured = event.structuredContent;
+  if (structured && typeof structured === "object" && !Array.isArray(structured)) {
+    const record = structured as Record<string, unknown>;
+    candidates.push(record);
+    candidates.push(record.structuredContent);
+    if (Array.isArray(record.content)) candidates.push(...record.content);
+  }
+  candidates.push(...event.content);
+  for (const candidate of candidates) {
+    if (isPayload(candidate)) return candidate;
+    if (candidate && typeof candidate === "object" && (candidate as { type?: unknown }).type === "text") {
+      const text = (candidate as { text?: unknown }).text;
+      if (typeof text !== "string") continue;
+      try {
+        const parsed: unknown = JSON.parse(text);
+        if (isPayload(parsed)) return parsed;
+      } catch {
+        // not JSON: try the next block
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Same-name error stub for a disabled/removed command tool: Pi has no
+ * unregisterTool, so re-registering replaces the live definition with one
+ * that always fails cleanly (spawn-time resolution also stops seeing it).
+ */
+export function registerDisabledToolStub(pi: ExtensionAPI, name: string, reason: "disabled" | "removed" = "disabled"): void {
+  pi.registerTool({
+    name,
+    label: name,
+    description: `Tool "${name}" is ${reason} and cannot be called.`,
+    parameters: { type: "object", properties: {} } as ToolDefinition["parameters"],
+    execute: async (): Promise<AgentToolResult> => ({
+      content: [{ type: "text", text: `tool "${name}" is ${reason}` }],
+      details: undefined,
+      isError: true,
+    }),
+  });
 }

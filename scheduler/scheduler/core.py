@@ -283,6 +283,10 @@ class Scheduler:
                 model=schedule.model,
                 schedule_id=schedule.id,
                 origin=schedule.reply_to or "scheduler",
+                # Lineage: the child inherits this conversation's tools
+                # (pinned at spawn by isidore). Legacy schedules carry None;
+                # the client only forwards truthy values, so they fire as before.
+                conversation_id=schedule.conversation_id,
             )
         except Exception as exc:  # noqa: BLE001 - keep the scheduler alive
             schedule.last_error = str(exc)

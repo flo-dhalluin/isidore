@@ -84,6 +84,10 @@ services:
       ISIDORE_TELEGRAM_WEBHOOK_URL: ${ISIDORE_TELEGRAM_WEBHOOK_URL:-}
       PI_SANDBOX_BROWSER_URL: http://browser:8931/mcp
       PI_SANDBOX_SCHEDULER_URL: http://scheduler:8940/mcp
+      # Tools authoring MCP (Phase 3): workers reach isidore's own endpoint by
+      # service name (they share isidore's network namespace; loopback would
+      # also work, but the service URL is explicit and override-friendly).
+      ISIDORE_TOOLS_URL: ${ISIDORE_TOOLS_URL:-http://isidore:8920/mcp/tools}
       NO_PROXY: ${NO_PROXY:-127.0.0.0/8,localhost},browser,scheduler,isidore
       no_proxy: ${NO_PROXY:-127.0.0.0/8,localhost},browser,scheduler,isidore
       GIT_AUTHOR_NAME: ${GIT_AUTHOR_NAME:-pi-sandbox}

@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { MAX_MANIFEST_BYTES, MAX_SOURCE_BYTES, MAX_TOOL_FILES, MAX_TOOLS_PER_CONVERSATION } from "../src/limits.ts";
-import { builtinManifests, ToolRegistry, validateToolInput, type ToolInput, type ToolOwner } from "../src/tools.ts";
+import { stageToolCache } from "../src/tool-cache.ts";
+import { builtinManifests, ToolRegistry, validateToolInput, type ResolvedTool, type ToolInput, type ToolOwner } from "../src/tools.ts";
 
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), "isidore-tools-"));
@@ -310,6 +311,40 @@ test("validateToolInput: argv, placeholders, schema, mcp and extension rules", (
   );
 });
 
+test("builtin:tools uses ISIDORE_TOOLS_URL or the port fallback; absent with neither", () => {
+  // Env URL wins (compose sets http://isidore:8920/mcp/tools).
+  const envUrl = builtinManifests({ ISIDORE_TOOLS_URL: "http://isidore:8920/mcp/tools" }, 9999);
+  const tools = envUrl.find((m) => m.id === "builtin:tools");
+  assert.ok(tools);
+  assert.equal(tools.name, "tools");
+  assert.equal(tools.kind, "mcp");
+  assert.deepEqual(tools.mcp, {
+    url: "http://isidore:8920/mcp/tools",
+    headers: { Authorization: "Bearer ${ISIDORE_TASK_TOKEN}" },
+    exposure: "direct",
+    timeout: 30,
+  });
+  assert.equal(tools.scope, "global");
+  assert.equal(tools.status, "active");
+  assert.equal(tools.provenance.origin, "builtin");
+  assert.match(tools.provenance.sha256, /^[0-9a-f]{64}$/);
+  // Port fallback when no env URL is set.
+  const fallback = builtinManifests({}, 8920).find((m) => m.id === "builtin:tools");
+  assert.equal(fallback?.mcp?.url, "http://127.0.0.1:8920/mcp/tools");
+  // Neither env URL nor port: no entry (bare dev/test environments).
+  assert.ok(!builtinManifests({}).some((m) => m.id === "builtin:tools"));
+  // resolveFor appends it; builtins are never persisted.
+  const dir = tempDir();
+  try {
+    const registry = new ToolRegistry(dir, { ISIDORE_TOOLS_URL: "http://isidore:8920/mcp/tools" }, 8920);
+    const resolved = registry.resolveFor({ rootId: "t_a", taskId: "t_a-1" });
+    assert.ok(resolved.some((tool) => tool.manifest.id === "builtin:tools"));
+    assert.deepEqual(new ToolRegistry(dir, {}).list(), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("builtinManifests match the legacy jq block and vanish when URLs are unset", () => {
   const env = { PI_SANDBOX_BROWSER_URL: "http://browser:8931/mcp", PI_SANDBOX_SCHEDULER_URL: "http://scheduler:8930/mcp" };
   const manifests = builtinManifests(env);
@@ -528,5 +563,112 @@ test("validateToolInput: $ref keys rejected, mention-in-text accepted; header hy
   }
   for (const value of ["a\r\nEvil: b", "a\nb", "a\rb", "a\0b"]) {
     assert.throws(() => validateToolInput(mcp({ "X-Ok": value }), opts), /CR\/LF/);
+  }
+});
+
+test("pending globals keep creator ownership: quota counted, names reusable elsewhere, clearOwnership releases", () => {
+  const dir = tempDir();
+  try {
+    const registry = new ToolRegistry(dir, {});
+    const globalOwner = (rootId: string): ToolOwner => ({ scope: "global", rootId, taskId: `${rootId}-task`, origin: "task" });
+    const pending = registry.create(commandInput("pendingname"), globalOwner("t_a"));
+    assert.equal(pending.status, "pending_approval");
+    // Ownership is KEPT on the index until human approval (Phase 4).
+    const index = registry.getIndex(pending.id);
+    assert.equal(index?.owner_root_id, "t_a");
+    assert.equal(index?.owner_task_id, "t_a-task");
+    // The immutable version manifest carries the FINAL status (written once).
+    const onDisk = JSON.parse(readFileSync(join(dir, pending.id, "1", "manifest.json"), "utf8"));
+    assert.equal(onDisk.status, "pending_approval");
+    // The same owner's names stay blocked (any status)…
+    assert.throws(() => registry.create(commandInput("pendingname"), convOwner("t_a")), /already exists/);
+    // …but another conversation neither sees nor is blocked by the pending global.
+    const bCopy = registry.create(commandInput("pendingname"), convOwner("t_b"));
+    assert.notEqual(bCopy.id, pending.id);
+    assert.ok(!registry.resolveFor({ rootId: "t_b", taskId: "t_b-task" }).some((tool) => tool.manifest.id === pending.id));
+    assert.ok(!registry.resolveFor({ rootId: "t_a", taskId: "t_a-task" }).some((tool) => tool.manifest.id === pending.id));
+    // Quota counts pending globals: fill t_a to the limit with them.
+    for (let i = 0; i < MAX_TOOLS_PER_CONVERSATION - 1; i++) {
+      registry.create(commandInput(`pg${i}`), globalOwner("t_a"));
+    }
+    assert.throws(() => registry.create(commandInput("onetoomany"), convOwner("t_a")), /32 tools/);
+    assert.throws(() => registry.create(commandInput("pgextra"), globalOwner("t_a")), /32 tools/);
+    // Other conversations are unaffected (and may reuse the pending names).
+    registry.create(commandInput("fresh"), convOwner("t_b"));
+    // clearOwnership (the Phase 4 approval step) releases the quota slot.
+    assert.equal(registry.clearOwnership(pending.id), true);
+    assert.equal(registry.getIndex(pending.id)?.owner_root_id, null);
+    assert.equal(registry.getIndex(pending.id)?.owner_task_id, null);
+    assert.equal(registry.clearOwnership("tl_missing"), false);
+    registry.create(commandInput("freed"), convOwner("t_a"));
+    // Disabled globals no longer block names either: uniqueness is among
+    // ACTIVE globals only.
+    const retired = registry.create(commandInput("retired"), humanOwner);
+    registry.setStatus(retired.id, "disabled");
+    registry.create(commandInput("retired"), convOwner("t_c"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("MCP namespace collisions (- vs _) are rejected at authoring time", () => {
+  const dir = tempDir();
+  try {
+    const registry = new ToolRegistry(dir, {});
+    const mcpInput = (name: string): ToolInput => ({ name, kind: "mcp", description: "d", mcp: { url: "http://x/mcp" } });
+    registry.create(mcpInput("my-server"), convOwner("t_a"));
+    // pi's mcpNamespace maps - to _: my-server and my_server would clash at
+    // pi.registerMcpServer. Rejected for the same owner, whatever the kind.
+    assert.throws(() => registry.create(mcpInput("my_server"), convOwner("t_a")), /normalization/);
+    assert.throws(() => registry.create(commandInput("my_server"), convOwner("t_a")), /normalization/);
+    // Other conversations don't see the tool: either variant is free there.
+    registry.create(mcpInput("my_server"), convOwner("t_b"));
+    // Active globals block normalized variants everywhere.
+    registry.create(mcpInput("global-srv"), humanOwner);
+    assert.throws(() => registry.create(mcpInput("global_srv"), convOwner("t_c")), /normalization/);
+    // Builtins too: tool-search normalizes onto builtin tool_search.
+    assert.throws(() => registry.create(commandInput("tool-search"), convOwner("t_c")), /normalization/);
+    // A pending global of ANOTHER conversation does not block the normalized
+    // variant (it is invisible there); its OWN owner is still blocked.
+    registry.create(mcpInput("awaiting-x"), { scope: "global", rootId: "t_d", taskId: "t_d-task", origin: "task" });
+    assert.throws(() => registry.create(mcpInput("awaiting_x"), convOwner("t_d")), /normalization/);
+    registry.create(mcpInput("awaiting_x"), convOwner("t_e"));
+    // Rename on update is checked as well.
+    const renameable = registry.create(commandInput("rename-me"), convOwner("t_f"));
+    registry.create(mcpInput("keep_name"), convOwner("t_f"));
+    assert.throws(() => registry.update(renameable.id, commandInput("keep-name")), /normalization/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("stageToolCache drops the copy when the tool was removed/disabled between resolve and staging", () => {
+  const dir = tempDir();
+  try {
+    const cache = join(dir, "cache");
+    const registry = new ToolRegistry(join(dir, "tools"), {});
+    // Removed after resolveFor, before staging: the just-staged copy is
+    // dropped best-effort and cachePath stays null.
+    const removed = registry.create(commandInput("racy"), convOwner("t_a"));
+    const resolved: ResolvedTool[] = [{ manifest: removed, cachePath: null }];
+    registry.remove(removed.id);
+    stageToolCache(registry, cache, "t_a", resolved);
+    assert.equal(resolved[0].cachePath, null);
+    assert.ok(!existsSync(join(cache, "t_a", removed.id, "1")));
+    // Disabled between resolve and staging: same treatment.
+    const disabled = registry.create(commandInput("racy2"), convOwner("t_a"));
+    const resolved2: ResolvedTool[] = [{ manifest: disabled, cachePath: null }];
+    registry.setStatus(disabled.id, "disabled");
+    stageToolCache(registry, cache, "t_a", resolved2);
+    assert.equal(resolved2[0].cachePath, null);
+    assert.ok(!existsSync(join(cache, "t_a", disabled.id, "1")));
+    // Active tools still stage normally.
+    const fine = registry.create(commandInput("fine"), convOwner("t_a"));
+    const resolved3: ResolvedTool[] = [{ manifest: fine, cachePath: null }];
+    stageToolCache(registry, cache, "t_a", resolved3);
+    assert.equal(resolved3[0].cachePath, join(cache, "t_a", fine.id, "1"));
+    assert.ok(existsSync(join(resolved3[0].cachePath!, "run.sh")));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

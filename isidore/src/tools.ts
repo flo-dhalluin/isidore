@@ -62,6 +62,8 @@ export interface ToolIndex {
   owner_task_id: string | null;
   current_version: number;
   versions: number[];
+  /** Agent's stated reason when it requested promotion (Phase 3); cleared on other status changes. */
+  promotion_reason?: string;
 }
 
 export interface ResolvedTool {
@@ -131,6 +133,18 @@ const MCP_KEYS: ReadonlySet<string> = new Set(["url", "headers", "exposure", "ti
 const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 
 const sha256 = (text: string): string => createHash("sha256").update(text).digest("hex");
+
+/**
+ * Pi's MCP namespace key, verified against the pinned SDK
+ * (dist/core/mcp-servers.js: mcpNamespace = `mcp__${name.replace(/-/g, "_")}`).
+ * Names are already lowercase (NAME_RE), so `-` -> `_` is the whole
+ * normalization: "my-server" and "my_server" would share mcp__my_server and
+ * pi.registerMcpServer throws on the clash. Used for authoring-time collision
+ * checks so a clash can never reach spawn-time registration.
+ */
+export function mcpNamespaceKey(name: string): string {
+  return name.replace(/-/g, "_");
+}
 
 /** JSON with recursively sorted object keys — stable provenance hashes. */
 function canonicalJson(value: unknown): string {
@@ -326,6 +340,8 @@ export function validateToolInput(input: ToolInput, opts: { allowExtension: bool
 
 const BROWSER_DESCRIPTION = "Headless Firefox: open pages, read and interact with them, fill forms, take screenshots";
 const SCHEDULER_DESCRIPTION = "Schedule one-shot or recurring tasks that spawn isolated Pi agents";
+const TOOLS_DESCRIPTION =
+  "Author and manage this conversation's tools: tool_create, tool_list, tool_get, tool_update, tool_disable, tool_remove, tool_request_promotion. New command/mcp tools are live in the same turn";
 
 function builtinProvenance(): ToolManifest["provenance"] {
   return { task_id: null, root_id: null, origin: "builtin", created_at: utcnow(), sha256: "" };
@@ -336,12 +352,13 @@ function builtinProvenance(): ToolManifest["provenance"] {
  * are byte-equivalent to the legacy entrypoint.sh jq block: exposure direct,
  * timeouts 120/30, scheduler task-token + origin headers (Pi expands ${VAR}
  * from the worker env), browser without auth headers. Entries vanish when the
- * corresponding PI_SANDBOX_*_URL is unset. `port` is reserved for builtin:tools
- * (Phase 3); the codemode/tool_search/mcp entries are informational — the
- * worker already loads those extensions through the SDK factories.
+ * corresponding PI_SANDBOX_*_URL is unset. builtin:tools (Phase 3) uses
+ * ISIDORE_TOOLS_URL when set, else http://127.0.0.1:<port>/mcp/tools when a
+ * port is given; with neither it is omitted (bare dev/test environments).
+ * The codemode/tool_search/mcp entries are informational — the worker already
+ * loads those extensions through the SDK factories.
  */
 export function builtinManifests(env: NodeJS.ProcessEnv, port?: number): ToolManifest[] {
-  void port;
   const manifests: ToolManifest[] = [];
   const browserUrl = env.PI_SANDBOX_BROWSER_URL;
   if (browserUrl) {
@@ -370,6 +387,21 @@ export function builtinManifests(env: NodeJS.ProcessEnv, port?: number): ToolMan
       status: "active",
       mcp: { url: schedulerUrl, headers, exposure: "direct", timeout: 30 },
       provenance: { ...builtinProvenance(), sha256: sha256(canonicalJson({ url: schedulerUrl, headers })) },
+    });
+  }
+  const toolsUrl = env.ISIDORE_TOOLS_URL || (port !== undefined ? `http://127.0.0.1:${port}/mcp/tools` : undefined);
+  if (toolsUrl) {
+    const headers = { Authorization: "Bearer ${ISIDORE_TASK_TOKEN}" };
+    manifests.push({
+      id: "builtin:tools",
+      name: "tools",
+      version: 1,
+      kind: "mcp",
+      description: TOOLS_DESCRIPTION,
+      scope: "global",
+      status: "active",
+      mcp: { url: toolsUrl, headers, exposure: "direct", timeout: 30 },
+      provenance: { ...builtinProvenance(), sha256: sha256(canonicalJson({ url: toolsUrl, headers })) },
     });
   }
   const extensions: Array<[string, string]> = [
@@ -465,26 +497,56 @@ export class ToolRegistry {
     }
   }
 
+  /**
+   * Uniqueness among the names the owner will actually see at spawn: ACTIVE
+   * globals + builtins + the same owner's tools (any status). A PENDING global
+   * of another conversation is invisible to this owner and must not block its
+   * names (no cross-conversation name squatting). Two conversations may hold
+   * same-name pending globals; Phase 4 human approval MUST re-check name
+   * collisions before activating a global.
+   *
+   * Also rejects MCP-namespace collisions (names differing only in `-`/`_`,
+   * see mcpNamespaceKey): pi.registerMcpServer throws on those, which would
+   * otherwise surface only at spawn time.
+   */
   private assertNameAvailable(name: string, owner: ToolOwner, excludeId: string | null): void {
     if (RESERVED_TOOL_NAMES.has(name) || BUILTIN_NAMES.has(name)) {
       throw new Error(`tool name "${name}" is reserved`);
     }
+    const normalized = mcpNamespaceKey(name);
+    for (const builtin of BUILTIN_NAMES) {
+      if (mcpNamespaceKey(builtin) === normalized) {
+        throw new Error(`tool name "${name}" collides with builtin "${builtin}" after MCP namespace normalization (- and _ are equivalent)`);
+      }
+    }
     for (const index of this.indexes.values()) {
-      if (index.id === excludeId || index.name !== name) continue;
+      if (index.id === excludeId) continue;
       const sameOwner =
         (owner.rootId !== null && index.owner_root_id === owner.rootId) ||
         (owner.taskId !== null && index.owner_task_id === owner.taskId);
-      if (index.scope === "global" || sameOwner) {
+      const visible = sameOwner || (index.scope === "global" && index.status === "active");
+      if (!visible) continue;
+      if (index.name === name) {
         throw new Error(`tool name "${name}" already exists`);
+      }
+      if (mcpNamespaceKey(index.name) === normalized) {
+        throw new Error(`tool name "${name}" collides with "${index.name}" after MCP namespace normalization (- and _ are equivalent)`);
       }
     }
   }
 
-  create(input: ToolInput, owner: ToolOwner, opts: { allowExtension?: boolean } = {}): ToolManifest {
+  create(
+    input: ToolInput,
+    owner: ToolOwner,
+    opts: { allowExtension?: boolean; forcePendingApproval?: boolean } = {},
+  ): ToolManifest {
     validateToolInput(input, { allowExtension: opts.allowExtension ?? false });
     if (owner.scope === "conversation" && !owner.rootId) throw new Error("conversation scope requires a rootId");
     if (owner.scope === "task" && (!owner.rootId || !owner.taskId)) throw new Error("task scope requires rootId and taskId");
     this.assertNameAvailable(input.name, owner, null);
+    // Quota counts ALL indexes owned by the conversation — including its
+    // pending globals (ownership is kept until human approval), so pending
+    // globals cannot be used to bypass the per-conversation limit.
     if (owner.rootId) {
       const count = [...this.indexes.values()].filter((index) => index.owner_root_id === owner.rootId).length;
       if (count >= MAX_TOOLS_PER_CONVERSATION) {
@@ -492,8 +554,12 @@ export class ToolRegistry {
       }
     }
     const id = newId("tl");
-    // Globals authored by agents await human approval; humans activate directly.
-    const status: ToolStatus = owner.scope === "global" && owner.origin !== "human" ? "pending_approval" : "active";
+    // Globals authored by agents await human approval; humans activate
+    // directly. forcePendingApproval lets the tools MCP force approval for
+    // task callers even when their origin string happens to be "human" —
+    // the FINAL status is written into the immutable version manifest once.
+    const status: ToolStatus =
+      owner.scope === "global" && (owner.origin !== "human" || opts.forcePendingApproval) ? "pending_approval" : "active";
     const manifest: ToolManifest = {
       id,
       name: input.name,
@@ -516,13 +582,19 @@ export class ToolRegistry {
     };
     this.assertManifestSize(manifest);
     this.writeVersion(manifest, input.command?.files ?? {});
+    // PENDING globals KEEP creator ownership: the creator can still see and
+    // manage them (withdraw/update/disable/remove), they count against its
+    // quota, and they stay invisible to every other conversation. Ownership
+    // is cleared ONLY when a human approval makes the tool active+global
+    // (Phase 4 approve() calls clearOwnership()). Active globals are unowned.
+    const pendingGlobal = owner.scope === "global" && status === "pending_approval";
     const index: ToolIndex = {
       id,
       name: input.name,
       scope: owner.scope,
       status,
-      owner_root_id: owner.scope === "global" ? null : owner.rootId,
-      owner_task_id: owner.scope === "task" ? owner.taskId : null,
+      owner_root_id: owner.scope === "global" && !pendingGlobal ? null : owner.rootId,
+      owner_task_id: owner.scope === "task" || pendingGlobal ? owner.taskId : null,
       current_version: 1,
       versions: [1],
     };
@@ -632,6 +704,36 @@ export class ToolRegistry {
     const index = this.indexes.get(id);
     if (!index) return false;
     index.status = status;
+    // A promotion reason only makes sense while the tool awaits approval.
+    if (status !== "pending_approval") delete index.promotion_reason;
+    this.writeIndex(index);
+    return true;
+  }
+
+  /**
+   * Clear creator ownership. Phase 4's human approval calls this when a
+   * pending global becomes active+global: the owner fields go null so no
+   * conversation keeps visibility, mutation rights or quota over it. Kept
+   * separate from setStatus so approval is an explicit, deliberate step.
+   */
+  clearOwnership(id: string): boolean {
+    const index = this.indexes.get(id);
+    if (!index) return false;
+    index.owner_root_id = null;
+    index.owner_task_id = null;
+    this.writeIndex(index);
+    return true;
+  }
+
+  /**
+   * Agent-requested promotion (Phase 3): pending_approval + the stated reason
+   * recorded on the index for the human approval surface (Phase 4).
+   */
+  requestPromotion(id: string, reason: string): boolean {
+    const index = this.indexes.get(id);
+    if (!index) return false;
+    index.status = "pending_approval";
+    index.promotion_reason = reason;
     this.writeIndex(index);
     return true;
   }

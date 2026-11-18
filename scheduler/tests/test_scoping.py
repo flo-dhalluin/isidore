@@ -508,8 +508,8 @@ class McpAdminGeneratedTokenTest(unittest.TestCase):
         asyncio.run(scenario())
 
 
-class FireUnchangedTest(unittest.TestCase):
-    def test_fire_passes_only_origin_model_schedule_id(self):
+class FireLineageKwargsTest(unittest.TestCase):
+    def test_fire_passes_origin_model_schedule_id_and_conversation(self):
         async def scenario():
             with tempfile.TemporaryDirectory() as tmp:
                 spawner = FakeSpawner()
@@ -525,8 +525,10 @@ class FireUnchangedTest(unittest.TestCase):
                 _, kwargs = spawner.calls[0]
                 self.assertEqual(kwargs["origin"], "telegram:42")
                 self.assertEqual(kwargs["schedule_id"], schedule.id)
-                # Lineage (parent/thread/conversation) is Phase 3, not Phase 0.
-                self.assertNotIn("conversation_id", kwargs)
+                # Lineage (Phase 3): the conversation id travels to isidore so
+                # the child inherits the conversation's tools pinned at spawn.
+                self.assertEqual(kwargs["conversation_id"], "t_root")
+                # parent/thread stay server-derived: the child is a NEW root.
                 self.assertNotIn("parent_id", kwargs)
                 self.assertNotIn("thread_id", kwargs)
 
