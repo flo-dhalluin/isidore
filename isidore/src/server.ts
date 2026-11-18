@@ -1,48 +1,19 @@
-import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
-import { timingSafeEqual } from "node:crypto";
+import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
+import { deny, resolveAuth } from "./auth.ts";
 import { generateAdminToken, tasksDir, toolCacheDir, toolsDir, workspacesDir, writeAdminToken, type Settings } from "./config.ts";
 import { Runner } from "./runner.ts";
 import { SchedulerClient } from "./scheduler.ts";
 import { TelegramBot } from "./telegram.ts";
 import { TaskStore, isDone, publicTask, rootId } from "./store.ts";
 import { renderTemplate } from "./templates.ts";
-import { TokenRegistry, type TaskScope } from "./tokens.ts";
+import { TokenRegistry } from "./tokens.ts";
 import { ToolRegistry } from "./tools.ts";
+import { removeToolCacheCopies } from "./tool-cache.ts";
+import { registerToolsMcp } from "./tools-mcp.ts";
 
 const MAX_PROMPT = 100_000;
-
-type Auth = { kind: "admin" } | { kind: "task"; scope: TaskScope } | null;
-
-/** Constant-time string equality (length-guarded timingSafeEqual). */
-function secretEquals(a: string, b: string): boolean {
-  const left = Buffer.from(a, "utf8");
-  const right = Buffer.from(b, "utf8");
-  return left.length === right.length && timingSafeEqual(left, right);
-}
-
-/**
- * Resolve the caller: the admin token (Bearer or `?token=`, the latter admin-only
- * for the UI) or a per-task capability token (Bearer only). No/invalid token =>
- * null (401). A task token is scoped to its conversation (rootId).
- */
-function resolveAuth(request: FastifyRequest, adminToken: string, tokens: TokenRegistry): Auth {
-  const header = request.headers.authorization;
-  if (typeof header === "string" && header.startsWith("Bearer ")) {
-    const bearer = header.slice("Bearer ".length);
-    if (secretEquals(bearer, adminToken)) return { kind: "admin" };
-    const scope = tokens.resolve(bearer);
-    if (scope) return { kind: "task", scope };
-  }
-  const queryToken = (request.query as { token?: string }).token;
-  if (queryToken && secretEquals(queryToken, adminToken)) return { kind: "admin" };
-  return null;
-}
-
-function deny(reply: FastifyReply): void {
-  reply.code(401).header("WWW-Authenticate", "Bearer").send({ error: "unauthorised" });
-}
 
 function notFound(reply: FastifyReply): void {
   reply.code(404).send({ error: "not found" });
@@ -61,7 +32,8 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
   const store = new TaskStore(tasksDir(settings), settings.maxOutput);
   // Tool registry (Phase 2): the runner composes each task's tools at spawn
   // and copies command sources into the read-only per-conversation tool-cache.
-  const registry = new ToolRegistry(toolsDir(settings));
+  // env + port feed builtinManifests (builtin:tools URL fallback, Phase 3).
+  const registry = new ToolRegistry(toolsDir(settings), process.env, settings.port);
   const toolCacheRoot = toolCacheDir(settings);
   const scheduler = new SchedulerClient(settings.schedulerUrl, settings.schedulerToken, undefined, settings.schedulerTokenFile);
   let bot: TelegramBot | null = null;
@@ -81,6 +53,7 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
     unsafeNoSandbox: settings.unsafeNoSandbox,
     registry,
     toolCacheRoot,
+    toolsUrl: settings.toolsUrl,
   });
 
   if (settings.telegramToken) {
@@ -92,6 +65,10 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
   }
 
   const app = Fastify({ logger: true });
+
+  // Tools authoring MCP (Phase 3): stateless streamable-HTTP JSON-RPC, scoped
+  // to the caller's conversation via the same resolveAuth as the REST API.
+  registerToolsMcp(app, { registry, tokens, adminToken, toolCacheRoot });
 
   // UI routes are admin-only; the token is never injected into the HTML (workers
   // share isidore's network namespace and could harvest it from loopback).
@@ -169,10 +146,24 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
       });
       return reply.code(202).send(publicTask(task));
     }
+    // Lineage (Phase 3, admin/scheduler path ONLY): conversation_id spawns a
+    // child that inherits the parent conversation's tools pinned at spawn.
+    // The child is a NEW root with its OWN workspace (parent_id/thread_id
+    // stay null); the task-token branch above never reads body.conversation_id.
+    let conversationId: string | null = null;
+    if (body.conversation_id !== undefined && body.conversation_id !== null && body.conversation_id !== "") {
+      conversationId = String(body.conversation_id);
+      if (store.thread(conversationId).length === 0) {
+        return reply.code(404).send({ error: `unknown conversation: ${conversationId}` });
+      }
+    }
     const task = runner.create(prompt, {
       model,
       origin: String(body.origin ?? "web"),
       schedule_id: body.schedule_id ? String(body.schedule_id) : null,
+      ...(conversationId !== null
+        ? { inherited_from: conversationId, inherited_tools: registry.snapshotConversation(conversationId) }
+        : {}),
     });
     return reply.code(202).send(publicTask(task));
   });
@@ -200,10 +191,14 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
     for (const turn of turns) store.remove(turn.id);
     rmSync(join(workspacesDir(settings), root), { recursive: true, force: true });
     // Cascade the conversation's tools: registry records (indexes + version
-    // dirs) and its read-only tool-cache copies. Cleanup failures are logged
-    // but must never fail the delete itself.
+    // dirs) and its read-only tool-cache copies. Children may hold PINNED
+    // cache copies of this conversation's tools under their own roots, so
+    // sweep every removed tool across ALL roots (same as tools-mcp
+    // tool_remove). Cleanup failures are logged but must never fail the
+    // delete itself.
     try {
-      registry.removeConversation(root);
+      const removed = registry.removeConversation(root);
+      for (const id of removed) removeToolCacheCopies(toolCacheRoot, id);
     } catch (error) {
       console.error(`isidore: tool registry cleanup for ${root} failed: ${error instanceof Error ? error.message : String(error)}`);
     }

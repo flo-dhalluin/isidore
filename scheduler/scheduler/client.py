@@ -46,7 +46,9 @@ class IsidoreClient:
 
     async def create_task(self, prompt: str, **kwargs: Any) -> dict[str, Any]:
         payload: dict[str, Any] = {"prompt": prompt, "origin": kwargs.pop("origin", "scheduler")}
-        for key in ("model", "schedule_id"):
+        # conversation_id (lineage): forwarded only when truthy so legacy
+        # schedules without a conversation produce the exact same payload.
+        for key in ("model", "schedule_id", "conversation_id"):
             value = kwargs.pop(key, None)
             if value:
                 payload[key] = value

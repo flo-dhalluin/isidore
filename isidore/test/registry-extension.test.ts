@@ -72,17 +72,33 @@ function mcpManifest(overrides: Partial<ToolManifest> = {}): ToolManifest {
 
 const resolved = (manifest: ToolManifest, cachePath: string | null = null): ResolvedTool => ({ manifest, cachePath });
 
-/** Minimal fake ExtensionAPI capturing registrations. */
-function fakePi(): { pi: ExtensionAPI; tools: Map<string, ToolDefinition>; servers: Map<string, unknown> } {
+/** Minimal fake ExtensionAPI capturing registrations and event handlers. */
+function fakePi(): {
+  pi: ExtensionAPI;
+  tools: Map<string, ToolDefinition>;
+  servers: Map<string, unknown>;
+  handlers: Map<string, Array<(event: never) => unknown>>;
+  toolRegistrations: string[];
+} {
   const tools = new Map<string, ToolDefinition>();
   const servers = new Map<string, unknown>();
+  const handlers = new Map<string, Array<(event: never) => unknown>>();
+  const toolRegistrations: string[] = [];
   const pi = {
-    registerTool: (def: ToolDefinition) => tools.set(def.name, def),
+    registerTool: (def: ToolDefinition) => {
+      tools.set(def.name, def);
+      toolRegistrations.push(def.name);
+    },
     registerMcpServer: (name: string, config: unknown) => servers.set(name, config),
     unregisterMcpServer: (name: string) => servers.delete(name),
-    on: () => () => {},
+    on: (event: string, handler: (event: never) => unknown) => {
+      const list = handlers.get(event) ?? [];
+      list.push(handler);
+      handlers.set(event, list);
+      return () => {};
+    },
   } as unknown as ExtensionAPI;
-  return { pi, tools, servers };
+  return { pi, tools, servers, handlers, toolRegistrations };
 }
 
 async function execute(
@@ -628,5 +644,262 @@ test("real session: mcp manifests connect with expanded ${VAR} headers; project 
     server.close();
     server.closeAllConnections();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- same-turn tool_result hook (Phase 3) ---
+
+/** Fire the extension's tool_result handler with a synthetic SDK-shaped event. */
+function fireToolResult(
+  handlers: Map<string, Array<(event: never) => unknown>>,
+  toolName: string,
+  overrides: Record<string, unknown> = {},
+): void {
+  const event = {
+    type: "tool_result",
+    toolName,
+    toolCallId: "call-1",
+    input: {},
+    content: [{ type: "text", text: "ok" }],
+    isError: false,
+    details: undefined,
+    ...overrides,
+  };
+  for (const handler of handlers.get("tool_result") ?? []) handler(event as never);
+}
+
+/** The REAL MCP event shape: structuredContent is the whole CallToolResult. */
+function mcpCreateEvent(payload: Record<string, unknown>, toolName = "mcp__tools__tool_create"): Record<string, unknown> {
+  return {
+    toolName,
+    content: [{ type: "text", text: JSON.stringify(payload) }],
+    structuredContent: { content: [{ type: "text", text: JSON.stringify(payload) }], structuredContent: payload },
+  };
+}
+
+test("same-turn: tool_create registers the command tool from the CallToolResult-wrapped structuredContent", async () => {
+  const dir = tempDir();
+  try {
+    const { pi, tools, handlers } = fakePi();
+    createRegistryExtension({ tools: [], cwd: dir })(pi);
+    const manifest = commandManifest({ name: "fresh" });
+    fireToolResult(handlers, "mcp__tools__tool_create", mcpCreateEvent({ manifest, cachePath: null }));
+    const def = tools.get("fresh");
+    assert.ok(def, "command tool not registered in the same turn");
+    const { text, isError } = await execute(def!, { text: "same-turn" }, dir);
+    assert.equal(isError, false);
+    assert.equal(text, "same-turn\n");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("same-turn: direct structuredContent and JSON-text fallback both register", async () => {
+  const dir = tempDir();
+  try {
+    const { pi, tools, handlers } = fakePi();
+    createRegistryExtension({ tools: [], cwd: dir })(pi);
+    // Direct payload (no CallToolResult wrapper).
+    fireToolResult(handlers, "mcp__tools__tool_create", {
+      toolName: "mcp__tools__tool_create",
+      structuredContent: { manifest: commandManifest({ name: "direct" }), cachePath: null },
+      content: [{ type: "text", text: "not json" }],
+    });
+    assert.ok(tools.get("direct"));
+    // JSON-text fallback: structuredContent absent entirely.
+    const payload = { manifest: commandManifest({ name: "fallback" }), cachePath: null };
+    fireToolResult(handlers, "mcp__tools__tool_update", {
+      toolName: "mcp__tools__tool_update",
+      content: [{ type: "text", text: JSON.stringify(payload) }],
+    });
+    assert.ok(tools.get("fallback"));
+    // Fallback also works from the wrapper's text content.
+    const wrapped = { manifest: commandManifest({ name: "wrappedtext" }), cachePath: null };
+    fireToolResult(handlers, "mcp__tools__tool_create", {
+      toolName: "mcp__tools__tool_create",
+      structuredContent: { content: [{ type: "text", text: JSON.stringify(wrapped) }] },
+      content: [],
+    });
+    assert.ok(tools.get("wrappedtext"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("same-turn: duplicate results do not re-register; a new version does", () => {
+  const { pi, handlers, toolRegistrations } = fakePi();
+  createRegistryExtension({ tools: [], cwd: "/ws" })(pi);
+  const manifest = commandManifest({ name: "dup" });
+  const event = mcpCreateEvent({ manifest, cachePath: null });
+  fireToolResult(handlers, "mcp__tools__tool_create", event);
+  fireToolResult(handlers, "mcp__tools__tool_create", event);
+  assert.deepEqual(toolRegistrations, ["dup"]);
+  // tool_update with a bumped version re-registers (replacement semantics).
+  fireToolResult(handlers, "mcp__tools__tool_update", mcpCreateEvent({ manifest: { ...manifest, version: 2 }, cachePath: null }, "mcp__tools__tool_update"));
+  assert.deepEqual(toolRegistrations, ["dup", "dup"]);
+});
+
+test("same-turn: mcp create registers the server immediately; unchanged config is not re-registered", () => {
+  const { pi, servers, handlers } = fakePi();
+  createRegistryExtension({ tools: [], cwd: "/ws" })(pi);
+  const manifest = mcpManifest({ name: "live-remote" });
+  fireToolResult(handlers, "mcp__tools__tool_create", mcpCreateEvent({ manifest, cachePath: null }));
+  assert.deepEqual(servers.get("live-remote"), {
+    url: "http://127.0.0.1:9/mcp",
+    headers: { Authorization: "Bearer ${ISIDORE_TASK_TOKEN}" },
+    exposure: "direct",
+    timeout: 30,
+    description: "a remote server",
+  });
+  // Same config again: the duplicate guard skips re-registration (the servers
+  // map keeps exactly one entry; a replaced config would still be one entry,
+  // so the guard is verified via the command-tool registration counter test).
+  fireToolResult(handlers, "mcp__tools__tool_update", mcpCreateEvent({ manifest, cachePath: null }, "mcp__tools__tool_update"));
+  assert.equal(servers.size, 1);
+  const changed = mcpManifest({ name: "live-remote", mcp: { url: "http://127.0.0.1:9/mcp-v2", exposure: "direct" } });
+  fireToolResult(handlers, "mcp__tools__tool_update", mcpCreateEvent({ manifest: changed, cachePath: null }, "mcp__tools__tool_update"));
+  assert.equal((servers.get("live-remote") as { url: string }).url, "http://127.0.0.1:9/mcp-v2");
+});
+
+test("same-turn: disable replaces a command tool with an error stub; remove unregisters mcp servers", async () => {
+  const dir = tempDir();
+  try {
+    const { pi, tools, servers, handlers } = fakePi();
+    const command = commandManifest({ name: "stubbed" });
+    const remote = mcpManifest({ name: "gone-remote" });
+    createRegistryExtension({ tools: [{ manifest: command, cachePath: null }, { manifest: remote, cachePath: null }], cwd: dir })(pi);
+    assert.ok(tools.get("stubbed"));
+    assert.ok(servers.has("gone-remote"));
+
+    fireToolResult(handlers, "mcp__tools__tool_disable", {
+      toolName: "mcp__tools__tool_disable",
+      structuredContent: { structuredContent: { id: command.id, name: "stubbed", kind: "command", status: "disabled" } },
+      content: [],
+    });
+    const stub = tools.get("stubbed");
+    assert.ok(stub);
+    const { text, isError } = await execute(stub!, { text: "x" }, dir);
+    assert.equal(isError, true);
+    assert.match(text, /disabled/);
+
+    fireToolResult(handlers, "mcp__tools__tool_remove", {
+      toolName: "mcp__tools__tool_remove",
+      structuredContent: { structuredContent: { id: remote.id, name: "gone-remote", kind: "mcp", removed: true } },
+      content: [],
+    });
+    assert.ok(!servers.has("gone-remote"));
+    // Removing an unknown server name is a no-op, not a throw.
+    fireToolResult(handlers, "mcp__tools__tool_remove", {
+      toolName: "mcp__tools__tool_remove",
+      structuredContent: { structuredContent: { id: "tl_x", name: "never-registered", kind: "mcp", removed: true } },
+      content: [],
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("same-turn: error results, foreign tools and pending manifests are ignored", () => {
+  const { pi, tools, servers, handlers } = fakePi();
+  createRegistryExtension({ tools: [], cwd: "/ws" })(pi);
+  const manifest = commandManifest({ name: "ignored" });
+  // isError: nothing happens.
+  fireToolResult(handlers, "mcp__tools__tool_create", { ...mcpCreateEvent({ manifest, cachePath: null }), isError: true });
+  // A different MCP server's similarly-named tool: nothing happens.
+  fireToolResult(handlers, "mcp__other__tool_create", mcpCreateEvent({ manifest, cachePath: null }, "mcp__other__tool_create"));
+  // Pending approval (agent-authored global): not live until approved.
+  fireToolResult(handlers, "mcp__tools__tool_create", mcpCreateEvent({ manifest: { ...manifest, status: "pending_approval" }, cachePath: null }));
+  // Malformed payloads: no throw, no registration.
+  fireToolResult(handlers, "mcp__tools__tool_create", { toolName: "mcp__tools__tool_create", content: [{ type: "text", text: "{broken" }] });
+  fireToolResult(handlers, "mcp__tools__tool_create", { toolName: "mcp__tools__tool_create", structuredContent: { structuredContent: { manifest: { nope: true } } }, content: [] });
+  assert.equal(tools.size, 0);
+  assert.equal(servers.size, 0);
+});
+
+test("same-turn: nested codemode calls (parentToolCallId set) take the same hook", async () => {
+  const dir = tempDir();
+  try {
+    const { pi, tools, handlers } = fakePi();
+    createRegistryExtension({ tools: [], cwd: dir })(pi);
+    const manifest = commandManifest({ name: "nested" });
+    fireToolResult(handlers, "mcp__tools__tool_create", {
+      ...mcpCreateEvent({ manifest, cachePath: null }),
+      toolCallId: "call-parent/1",
+      parentToolCallId: "call-parent",
+    });
+    const def = tools.get("nested");
+    assert.ok(def);
+    const { text } = await execute(def!, { text: "from-codemode" }, dir);
+    assert.equal(text, "from-codemode\n");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+test("spawn-time registration failure skips one tool, not the whole set (MCP namespace clash)", () => {
+  const { pi, tools, servers } = fakePi();
+  // Simulate pi.registerMcpServer's namespace-clash throw (names differing
+  // only in -/_ share mcp__<name>): the SECOND server must fail, the rest
+  // must still register.
+  const original = pi.registerMcpServer.bind(pi);
+  pi.registerMcpServer = (name: string, config: Parameters<ExtensionAPI["registerMcpServer"]>[1]) => {
+    if (name === "clash_srv") throw new Error(`MCP server "${name}" conflicts with registered server "clash-srv"`);
+    original(name, config);
+  };
+  const logged: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => {
+    logged.push(args.join(" "));
+  };
+  try {
+    createRegistryExtension({
+      tools: [
+        resolved(mcpManifest({ name: "clash-srv" })),
+        resolved(mcpManifest({ id: "tl_ffffffffffff", name: "clash_srv" })),
+        resolved(commandManifest()),
+      ],
+      cwd: "/ws",
+    })(pi);
+  } finally {
+    console.error = originalError;
+  }
+  assert.ok(servers.has("clash-srv"), "the first server must stay registered");
+  assert.ok(!servers.has("clash_srv"));
+  assert.ok(tools.has("echoer"), "a failing mcp registration must not drop the command tools");
+  assert.ok(logged.some((line) => line.includes("clash_srv") && line.includes("skipping")), "failure not logged to stderr");
+});
+
+test("real session: an MCP namespace clash at spawn skips one server; command tools stay live", async () => {
+  const workspace = tempDir();
+  const logged: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => {
+    logged.push(args.join(" "));
+  };
+  let real: RealSession | undefined;
+  try {
+    // Two mcp names sharing pi's mcp__ namespace (clash-srv vs clash_srv).
+    // The first is registered by an EARLIER extension (committed before the
+    // registry extension loads), so the real pi.registerMcpServer throws on
+    // the second at spawn time. The loop must catch it and keep the rest.
+    real = await realSession(workspace, [
+      (pi) => {
+        pi.registerMcpServer("clash-srv", { url: "http://127.0.0.1:9/mcp", exposure: "direct" });
+      },
+      createRegistryExtension({
+        tools: [resolved(mcpManifest({ id: "tl_ffffffffffff", name: "clash_srv" })), resolved(commandManifest())],
+        cwd: workspace,
+      }),
+    ]);
+    assert.ok(real.session.getActiveToolNames().includes("echoer"), "command tool dropped by the mcp clash");
+    const def = real.session.getToolDefinition("echoer");
+    assert.ok(def);
+    const result = await def.execute("call-1", { text: "still alive" }, undefined, undefined, { cwd: workspace } as never);
+    assert.ok(!result.isError);
+    assert.deepEqual(result.content, [{ type: "text", text: "still alive\n" }]);
+    assert.ok(logged.some((line) => line.includes("clash_srv") && line.includes("skipping")));
+  } finally {
+    console.error = originalError;
+    real?.dispose();
+    rmSync(workspace, { recursive: true, force: true });
   }
 });

@@ -207,7 +207,73 @@ failed. In production a missing `ISIDORE_SANDBOX_BIN` likewise fails the task;
 
 ```sh
 cd isidore && npm test          # store/runner/server/tokens/env-scrub (+ sandbox after A)
-cd scheduler && uv run python -m unittest discover tests   # core + scoping
+cd scheduler && uv run python -m unittest discover tests   # core + scoping + lineage
 ```
 
 Both must pass. Launcher tests live next to `isidore/test/runner.test.ts`.
+
+## 10. Phase 3 acceptance (authoring, same-turn, lineage)
+
+Automated coverage (all in the suites above):
+
+- **Same-turn create/use** — `test/tools-mcp.test.ts` "real Pi MCP client":
+  a real `AgentSession` with `createMcpExtension` connects to the live
+  `/mcp/tools` endpoint; `tool_create` driven through `ctx.executeTool` (the
+  nested codemode path) registers the command tool via the `tool_result` hook
+  BEFORE the creating call resolves, and the tool executes. Hook mechanics
+  (wrapped/direct/JSON-text payloads, duplicate guard, disable stub, mcp
+  unregister) are in `test/registry-extension.test.ts`.
+- **Follow-up sees it / B cannot** — `tools-mcp.test.ts` scoping tests
+  (list/get/update/disable/remove/promotion across conversations) and
+  `tools.test.ts` `resolveFor` unions; B's cache dir never holds A's sources.
+- **Sandboxed execution** — Phase 2 `sandbox.test.ts` (tool-cache `--rx`,
+  `/state/tools` denied) + `registry-extension.test.ts` (scrubbed env,
+  workspace cwd) apply unchanged to authored command tools.
+- **Child lineage** — `server.test.ts` "admin POST conversation_id pins
+  inherited_tools…": the child is a NEW root with its own workspace, the
+  worker request carries the pinned version with a cache copy under the
+  child's root; task-token POST ignores body `conversation_id`.
+  `scheduler/tests/test_lineage.py`: fire carries `conversation_id`, the
+  client forwards it only when truthy, legacy schedules fire unchanged.
+- **Child tools invisible to the parent** — `tools-mcp.test.ts` "child
+  authoring scope": ownership follows the child's token; promotion is a
+  REQUEST (pending_approval + reason on the index) and only a human approval
+  (Phase 4) makes it global.
+- **Promotion / disable** — `tools-mcp.test.ts` promotion + disable/remove
+  tests; pending/disabled tools never resolve for new spawns.
+- **Pending-global isolation (review fix)** — `tools-mcp.test.ts` "pending
+  globals: invisible to other conversations…" + "quota counts pending
+  globals": a pending global KEEPS creator ownership (owner_root_id/
+  owner_task_id on the index) until human approval clears it (Phase 4
+  `registry.clearOwnership`). Other conversations can neither list/get it
+  (no source leak) nor are blocked by its names; the creator can still
+  update/disable/remove it; it counts against the 32-tool quota. Active
+  globals stay visible to everyone.
+- **MCP namespace clashes (review fix)** — `tools.test.ts` "MCP namespace
+  collisions": names differing only in `-`/`_` are rejected at authoring
+  (pi's `mcpNamespace` maps `-` to `_`); `registry-extension.test.ts`
+  "spawn-time registration failure…" proves one failing registration no
+  longer drops the whole tool set (fake pi + real session).
+- **Delete cascade / update scope (review fixes)** — `server.test.ts`
+  cascade test: deleting a conversation also sweeps children's pinned cache
+  copies of its tools across ALL roots; `tools-mcp.test.ts`: `tool_update`
+  rejects `scope` (create-only), extension kind is rejected for ALL callers
+  (human-authored via the admin API, Phase 4), and disabled/pending tools
+  are not cache-staged on update.
+
+Manual same-turn smoke (sandbox on, after `docker compose up -d --build`):
+
+```
+Conversation A prompt:
+  Use the tools MCP tool_create to make a command tool named greeter
+  (argv ["echo", "hello {{name}}"], schema {name: string}), then call
+  greeter with name="world" in this same turn and report its output.
+```
+
+Expected: the create result carries `{manifest, cachePath}`; `greeter` is
+callable in the SAME turn (no follow-up needed) and prints `hello world`.
+A follow-up ("call greeter again") still sees it; conversation B's
+`tool_list` does not. Then have A `schedule_task(prompt="call greeter",
+at="+1m")`: the fired child runs in its OWN workspace with the pinned
+tool, and a tool the child creates is absent from A's `tool_list`.
+
