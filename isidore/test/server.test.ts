@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createApp } from "../src/server.ts";
-import { tasksDir, toolCacheDir, toolsDir, type Settings } from "../src/config.ts";
+import { tasksDir, toolCacheDir, toolsDir, workspacesDir, type Settings } from "../src/config.ts";
 import { TaskStore, createTask, utcnow } from "../src/store.ts";
 import { ToolRegistry, type ToolInput } from "../src/tools.ts";
 
@@ -36,6 +36,7 @@ function settingsFor(dir: string): Settings {
     telegramWebhookSecret: null,
     sandboxBin: null,
     unsafeNoSandbox: true,
+    toolsUrl: null,
   };
 }
 
@@ -321,6 +322,17 @@ test("deleting a conversation cascades its registry tools and tool-cache dir", a
   const cacheDir = join(toolCacheDir(settings), "t_cascade", mine.id, "1");
   mkdirSync(cacheDir, { recursive: true });
   writeFileSync(join(cacheDir, "run.sh"), "#!/bin/sh\necho hi\n");
+  // A CHILD conversation holds pinned cache copies of the parent's tools
+  // under its own root (inherited_tools at spawn)…
+  for (const id of [mine.id, mineTask.id]) {
+    const childCopy = join(toolCacheDir(settings), "t_child", id, "1");
+    mkdirSync(childCopy, { recursive: true });
+    writeFileSync(join(childCopy, "run.sh"), "#!/bin/sh\necho hi\n");
+  }
+  // …while another conversation's OWN tool cache must survive the delete.
+  const otherCopy = join(toolCacheDir(settings), "t_other", other.id, "1");
+  mkdirSync(otherCopy, { recursive: true });
+  writeFileSync(join(otherCopy, "run.sh"), "#!/bin/sh\necho hi\n");
   const { app } = await createApp(settings);
   try {
     const deleted = await app.inject({ method: "DELETE", url: "/api/tasks/t_cascade", headers: adminAuth });
@@ -330,6 +342,11 @@ test("deleting a conversation cascades its registry tools and tool-cache dir", a
     assert.ok(!existsSync(join(toolsDir(settings), mineTask.id)));
     // …and so is the conversation's tool-cache dir.
     assert.ok(!existsSync(join(toolCacheDir(settings), "t_cascade")));
+    // The child's PINNED cache copies of the deleted tools are swept too…
+    assert.ok(!existsSync(join(toolCacheDir(settings), "t_child", mine.id)));
+    assert.ok(!existsSync(join(toolCacheDir(settings), "t_child", mineTask.id)));
+    // …but other conversations' own tools and cache copies are untouched.
+    assert.ok(existsSync(join(otherCopy, "run.sh")));
     // A fresh registry no longer resolves the deleted conversation's tools.
     const fresh = new ToolRegistry(toolsDir(settings), {});
     assert.equal(fresh.get(mine.id), undefined);
@@ -409,6 +426,126 @@ test("schedules proxy reads the scheduler token file when no env token is set", 
     assert.equal(calls[0].headers.authorization, "Bearer generated-sched-token");
   } finally {
     globalThis.fetch = originalFetch;
+    await app.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("admin POST conversation_id pins inherited_tools and spawns a NEW root with its own workspace", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "isidore-server-"));
+  const settings = settingsFor(dir);
+  // The worker dumps its stdin request so we can verify the composed tools.
+  writeFileSync(settings.workerScript, "#!/bin/sh\ncat > request.json\nprintf 'child done\\n'\n");
+  const { app, tokens } = await createApp(settings);
+  try {
+    const parent = await makeTask(app, "parent conversation");
+    const tokenParent = tokens.issue(parent);
+    // Author a tool in the parent conversation through the tools MCP.
+    const created = await app.inject({
+      method: "POST",
+      url: "/mcp/tools",
+      headers: bearer(tokenParent),
+      payload: {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "tool_create",
+          arguments: {
+            name: "heirloom",
+            kind: "command",
+            description: "inherited tool",
+            input_schema: { type: "object", properties: {} },
+            argv: ["echo", "hi"],
+            files: { "run.sh": "#!/bin/sh\necho hi\n" },
+          },
+        },
+      },
+    });
+    assert.equal(created.statusCode, 200);
+    const manifest = created.json().result.structuredContent.manifest;
+    // Move the tool to version 2: the child must pin the CURRENT version at spawn.
+    const updated = await app.inject({
+      method: "POST",
+      url: "/mcp/tools",
+      headers: bearer(tokenParent),
+      payload: { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "tool_update", arguments: { id: manifest.id, description: "v2" } } },
+    });
+    assert.equal(updated.json().result.structuredContent.manifest.version, 2);
+
+    const spawned = await app.inject({
+      method: "POST",
+      url: "/api/tasks",
+      headers: adminAuth,
+      payload: { prompt: "child of the conversation", conversation_id: parent.id, origin: "scheduler", schedule_id: "s_1" },
+    });
+    assert.equal(spawned.statusCode, 202);
+    const child = spawned.json();
+    // Lineage fields are pinned at spawn; the child is a NEW root.
+    assert.equal(child.inherited_from, parent.id);
+    assert.deepEqual(child.inherited_tools, [{ id: manifest.id, version: 2 }]);
+    assert.equal(child.parent_id, null);
+    assert.equal(child.thread_id, null);
+    assert.equal(child.origin, "scheduler");
+    assert.equal(child.schedule_id, "s_1");
+    const finished = await waitForTerminal(app, child.id);
+    // Own workspace under its OWN root id, not the parent's.
+    assert.equal(finished.workspace, join(workspacesDir(settings), child.id));
+    assert.notEqual(finished.workspace, join(workspacesDir(settings), parent.id));
+    // The worker request carried the pinned tool with a cache copy under the
+    // CHILD's root (resolveFor honors Task.inherited_tools).
+    const request = JSON.parse(readFileSync(join(finished.workspace, "request.json"), "utf8"));
+    const pinned = request.tools.find((tool: { manifest: { id: string } }) => tool.manifest.id === manifest.id);
+    assert.ok(pinned, "pinned inherited tool missing from the worker request");
+    assert.equal(pinned.manifest.version, 2);
+    assert.equal(pinned.manifest.description, "v2");
+    assert.equal(pinned.cachePath, join(toolCacheDir(settings), child.id, manifest.id, "2"));
+    assert.ok(existsSync(join(pinned.cachePath, "run.sh")));
+    // The parent conversation is untouched: its thread still has one turn.
+    const thread = await app.inject({ method: "GET", url: `/api/tasks/${parent.id}/thread`, headers: adminAuth });
+    assert.equal(thread.json().turns.length, 1);
+
+    // Unknown conversation => 404, nothing spawned.
+    const unknown = await app.inject({
+      method: "POST",
+      url: "/api/tasks",
+      headers: adminAuth,
+      payload: { prompt: "orphan", conversation_id: "t_nope" },
+    });
+    assert.equal(unknown.statusCode, 404);
+    // Without conversation_id the lineage fields stay null.
+    const plain = await app.inject({ method: "POST", url: "/api/tasks", headers: adminAuth, payload: { prompt: "plain" } });
+    assert.equal(plain.json().inherited_from, null);
+    assert.equal(plain.json().inherited_tools, null);
+    await waitForTerminal(app, plain.json().id);
+  } finally {
+    await app.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("task-token POST /api/tasks ignores body conversation_id (no self-service lineage)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "isidore-server-"));
+  const { app, tokens } = await createApp(settingsFor(dir));
+  try {
+    const taskA = await makeTask(app, "A");
+    const taskB = await makeTask(app, "B");
+    const tokenA = tokens.issue(taskA);
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/tasks",
+      headers: bearer(tokenA),
+      payload: { prompt: "followup", conversation_id: taskB.id, inherited_from: taskB.id, inherited_tools: [{ id: "tl_evil", version: 1 }] },
+    });
+    assert.equal(created.statusCode, 202);
+    const child = created.json();
+    // Still a plain followup of A's own conversation; body lineage ignored.
+    assert.equal(child.parent_id, taskA.id);
+    assert.equal(child.thread_id, taskA.id);
+    assert.equal(child.inherited_from, null);
+    assert.equal(child.inherited_tools, null);
+    await waitForTerminal(app, child.id);
+  } finally {
     await app.close();
     rmSync(dir, { recursive: true, force: true });
   }

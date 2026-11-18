@@ -1,8 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createTask, isDone, rootId, type Task, type TaskStore, utcnow } from "./store.ts";
+import { stageToolCache } from "./tool-cache.ts";
 import { TokenRegistry } from "./tokens.ts";
 import { builtinManifests, type ResolvedTool, type ToolRegistry } from "./tools.ts";
 import { MAX_EVENT_TEXT } from "./limits.ts";
@@ -34,6 +34,12 @@ export interface RunnerOptions {
    * createApp passes toolCacheDir(settings) explicitly. Injectable for tests.
    */
   toolCacheRoot?: string;
+  /**
+   * Tools authoring MCP URL (settings.toolsUrl / ISIDORE_TOOLS_URL) for the
+   * no-registry builtin fallback; with a registry configured the URL comes
+   * from the registry's env/port instead.
+   */
+  toolsUrl?: string | null;
 }
 
 export interface WorkerRequest {
@@ -289,6 +295,7 @@ export class Runner {
   private readonly agentDir: string;
   private readonly registry: ToolRegistry | null;
   private readonly toolCacheRoot: string;
+  private readonly toolsUrl: string | null;
   private readonly procs = new Map<string, ChildProcess>();
   private readonly jobs = new Set<Promise<void>>();
   private active = 0;
@@ -312,6 +319,7 @@ export class Runner {
     this.agentDir = options.agentDir ?? this.baseEnv.PI_CODING_AGENT_DIR ?? "/state/pi";
     this.registry = options.registry ?? null;
     this.toolCacheRoot = options.toolCacheRoot ?? join(this.baseEnv.ISIDORE_STATE ?? "/state", "tool-cache");
+    this.toolsUrl = options.toolsUrl ?? this.baseEnv.ISIDORE_TOOLS_URL ?? null;
     this.sweepToolCacheStaging();
     if (this.unsafeNoSandbox) {
       console.error("======================================================================");
@@ -405,54 +413,16 @@ export class Runner {
    */
   private resolveTools(task: Task): ResolvedTool[] {
     if (!this.registry) {
-      return builtinManifests(this.baseEnv).map((manifest) => ({ manifest, cachePath: null }));
+      const env = this.toolsUrl ? { ...this.baseEnv, ISIDORE_TOOLS_URL: this.toolsUrl } : this.baseEnv;
+      return builtinManifests(env).map((manifest) => ({ manifest, cachePath: null }));
     }
-    // Task.inherited_tools arrives with Phase 3 lineage; read it defensively
-    // so pinned inheritance already works once the field exists.
-    const inherited =
-      (task as Task & { inherited_tools?: Array<{ id: string; version: number }> | null }).inherited_tools ?? undefined;
+    // Lineage (Phase 3): admin/scheduler spawns pin the parent conversation's
+    // tools at spawn time (Task.inherited_tools); resolveFor honors the pins.
+    const inherited = task.inherited_tools ?? undefined;
     const warnings: string[] = [];
     const resolved = this.registry.resolveFor({ rootId: rootId(task), taskId: task.id, inherited }, warnings);
     for (const warning of warnings) console.error(`isidore: tool resolution: ${warning}`);
     return resolved;
-  }
-
-  /**
-   * Copy command/extension sources from the service-only registry into the
-   * per-conversation read-only tool-cache: <toolCacheRoot>/<rootId>/<id>/<v>/.
-   * Only if absent — versions are immutable, so an existing copy is never
-   * rewritten (staging dir + rename, same pattern as the registry itself).
-   * Sets ResolvedTool.cachePath. Files are chmod'd executable; the Landlock
-   * cache rule is --rx (read + execute, no write), so a cached shebang script
-   * can be exec'd directly as argv[0] while the copies stay tamper-resistant.
-   */
-  private stageToolCache(resolved: ResolvedTool[], rootId: string): void {
-    for (const tool of resolved) {
-      const manifest = tool.manifest;
-      if (manifest.kind !== "command" && manifest.kind !== "extension") continue;
-      if (manifest.id.startsWith("builtin:")) continue; // builtins carry no sources
-      const dest = join(this.toolCacheRoot, rootId, manifest.id, String(manifest.version));
-      tool.cachePath = dest;
-      if (existsSync(dest)) continue;
-      const parent = dirname(dest);
-      mkdirSync(parent, { recursive: true });
-      const stage = join(parent, `.tmp-${randomBytes(6).toString("hex")}`);
-      mkdirSync(stage, { recursive: true });
-      try {
-        const source = this.registry?.filesDir(manifest.id, manifest.version);
-        if (source && existsSync(source)) {
-          cpSync(source, stage, { recursive: true });
-          for (const entry of readdirSync(stage, { recursive: true, withFileTypes: true })) {
-            if (entry.isFile()) chmodSync(join(entry.parentPath ?? stage, entry.name), 0o755);
-          }
-        }
-        renameSync(stage, dest);
-      } catch (error) {
-        rmSync(stage, { recursive: true, force: true });
-        // A concurrent spawn may have won the race; an existing copy is fine.
-        if (!existsSync(dest)) throw error;
-      }
-    }
   }
 
   private notify(task: Task): void {
@@ -538,7 +508,7 @@ export class Runner {
     this.notify(task);
 
     const resolved = this.resolveTools(task);
-    this.stageToolCache(resolved, rootId(task));
+    stageToolCache(this.registry, this.toolCacheRoot, rootId(task), resolved);
     const request = buildWorkerRequest(task, this.model, this.baseEnv.OPENROUTER_API_KEY ?? null, resolved);
     // In dev the worker is TypeScript; Node runs it with type stripping.
     const workerArgs = this.workerScript.endsWith(".ts")

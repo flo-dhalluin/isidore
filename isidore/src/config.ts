@@ -27,6 +27,8 @@ export interface Settings {
   sandboxBin: string | null;
   /** ISIDORE_UNSAFE_NO_SANDBOX=1: run workers without the launcher (logged loudly). */
   unsafeNoSandbox: boolean;
+  /** ISIDORE_TOOLS_URL: the tools authoring MCP endpoint workers connect to (builtin:tools). */
+  toolsUrl: string | null;
 }
 
 function envInt(name: string, fallback: number): number {
@@ -110,6 +112,7 @@ export function loadSettings(): Settings {
     telegramWebhookSecret: envSecret("ISIDORE_TELEGRAM_WEBHOOK_SECRET"),
     sandboxBin: process.env.ISIDORE_SANDBOX_BIN ?? "/usr/local/bin/isidore-sandbox",
     unsafeNoSandbox: process.env.ISIDORE_UNSAFE_NO_SANDBOX === "1",
+    toolsUrl: process.env.ISIDORE_TOOLS_URL || null,
   };
   // Always publish the effective token (env-provided or generated) so the
   // scheduler can read it from the shared volume.
