@@ -25,6 +25,7 @@ import { deny, resolveAuth, type Auth } from "./auth.ts";
 import { removeToolCacheCopies, stageToolCache } from "./tool-cache.ts";
 import type { TaskScope, TokenRegistry } from "./tokens.ts";
 import type { ResolvedTool, ToolIndex, ToolInput, ToolKind, ToolManifest, ToolRegistry, ToolScope } from "./tools.ts";
+import { withLiveState } from "./tools.ts";
 
 export interface ToolsMcpOptions {
   registry: ToolRegistry;
@@ -90,10 +91,10 @@ function buildInput(args: Record<string, unknown>, current?: ToolManifest): Tool
   const kind = (args.kind ?? current?.kind) as ToolKind;
   // Extension tools are inert through this MCP (sources are human-managed and
   // never staged), so they are rejected for ALL callers — including admin.
-  // Humans author them through the admin API (Phase 4); the registry itself
-  // keeps extension support.
+  // Humans author them through the admin API (POST /api/tools); the registry
+  // itself keeps extension support.
   if (kind === "extension") {
-    throw new Error("extension tools are human-authored via the admin API (Phase 4); the tools MCP only authors command and mcp tools");
+    throw new Error("extension tools are human-authored via the admin API (POST /api/tools); the tools MCP only authors command and mcp tools");
   }
   const input: ToolInput = {
     name: (args.name ?? current?.name) as string,
@@ -156,9 +157,9 @@ function ownedIndex(registry: ToolRegistry, id: unknown, caller: Caller, mutate:
   return index;
 }
 
-/** Live status lives on the index; manifests are immutable per version. */
+/** Live status/scope lives on the index; manifests are immutable per version. */
 function withLiveStatus(manifest: ToolManifest, index: ToolIndex): ToolManifest {
-  return { ...manifest, status: index.status };
+  return withLiveState(manifest, index);
 }
 
 /** Stage the caller's cache copy for a freshly authored command/extension version. */
@@ -270,7 +271,7 @@ const STRING_MAP = { type: "object", additionalProperties: { type: "string" } } 
 function authorProperties(withScope: boolean): Record<string, unknown> {
   return {
     name: { type: "string", description: "Tool name: ^[a-z][a-z0-9_-]{0,63}$, unique in your conversation; - and _ are equivalent (MCP namespace)" },
-    kind: { type: "string", enum: ["mcp", "command"], description: "extension tools are human-authored via the admin API, not here" },
+    kind: { type: "string", enum: ["mcp", "command"], description: "extension tools are human-authored via the admin API (POST /api/tools), not here" },
     description: { type: "string", description: "What the tool does (shown to the model)" },
     input_schema: { type: "object", description: 'command tools: JSON Schema with type:"object"; no $ref' },
     files: { ...STRING_MAP, description: "command sources: relative path -> text (copied to the read-only tool cache)" },

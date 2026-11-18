@@ -164,7 +164,8 @@ no public URL or open port. A [webhook](#webhook-optional) is optional.
    `curl localhost:8920/api/info` (plus `-H "Authorization: Bearer $ISIDORE_TOKEN"`
    if set) should report `"telegram": true, "telegram_mode": "polling"`.
 4. **Use it**: send plain text or `/new <prompt>` to queue a task; `/list`,
-   `/status <id>`, `/cancel <id>`, `/help`. The originating chat gets the task's
+   `/status <id>`, `/cancel <id>`, `/tools`, `/approve <id>`, `/help`. The
+   originating chat gets the task's
    output when it finishes (split into several messages if long).
    **Reply** to any of the bot's task messages to continue that conversation:
    the reply becomes the next turn of the thread, with the same workspace and
@@ -221,8 +222,9 @@ See [isidore/README.md](isidore/README.md#telegram).
 ## Scheduler (schedule tasks)
 
 `scheduler` is an MCP tool server (streamable HTTP at `/mcp`) plus a firing
-loop. Pi gets it through `mcp.json` automatically, so the agent can call
-`schedule_task`, `list_schedules`, `cancel_schedule` and `run_schedule_now`.
+loop. Pi gets it as a builtin of the [tool registry](#tool-registry), so the
+agent can call `schedule_task`, `list_schedules`, `cancel_schedule` and
+`run_schedule_now`.
 A schedule is either one-shot (`at`, ISO-8601 or `+30m`) or recurring
 (`every`, e.g. `30m`, `2h`, `1d`). When due, the scheduler calls isidore's
 `POST /api/tasks`; schedules persist in `schedules.json` across restarts.
@@ -237,8 +239,8 @@ set (compose does this). See [scheduler/README.md](scheduler/README.md).
 
 ## Browser
 
-isidore's entrypoint adds `mcpServers.browser = {url: "http://browser:8931/mcp",
-exposure: "direct"}` to the shared Pi config, so every spawned task gets it.
+isidore composes `browser` (`http://browser:8931/mcp`, exposure `direct`)
+into every spawned task as a builtin of the [tool registry](#tool-registry).
 `browser` is appended to `NO_PROXY`/`no_proxy`, since Docker injects
 `~/.docker/config.json` proxies into every container.
 
@@ -250,6 +252,56 @@ with element refs like `[ref=e12]`), `get_text` (markdown/text, paged), `click`,
 no file upload/download.
 
 Smoke test: `docker compose exec -T browser python - < pilot.py`.
+
+## Tool registry
+
+Every spawned task is composed from a service-owned tool registry: the
+builtins (browser, scheduler, the `tools` authoring MCP) plus the
+conversation's own tools and any human-approved global tools. Agents author
+`mcp` and `command` tools through the `tools` MCP — `tool_create`,
+`tool_list`, `tool_get`, `tool_update`, `tool_disable`, `tool_remove`,
+`tool_request_promotion` — and can use them in the same turn. `extension`
+tools are human-authored only, via `POST /api/tools` (admin), never the
+agent MCP; humans can author `command`/`mcp` globals there too (active
+immediately, origin `human`).
+
+Records live under `/state/tools/<id>/`: a mutable `index.json` (scope,
+status, ownership, current version) plus one immutable directory per version
+(`manifest.json` + source files). Workers never read `/state/tools`; the
+service copies command sources into
+`/state/tool-cache/<conversation>/<id>/<version>/`, which the sandbox mounts
+read-only. Deleting a conversation deletes its tools and every cache copy.
+
+New tools are scoped to their conversation. Going global always needs a
+human: the agent calls `tool_request_promotion` (status `pending_approval`),
+then you approve from the tool registry page (`/tools?token=<TOKEN>`, linked
+from the main UI), via `POST /api/tools/<id>/approve`, or with Telegram
+`/approve <id>` (allowed chats only; `/tools` lists pending promotions and
+active globals). Approval re-checks name collisions, activates the tool for
+every new spawn and clears creator ownership in one atomic index write; the
+web confirm shows the tool's name + version and sends `expected_version`, so
+an update sneaked in between review and approval is refused with 409. Rejecting keeps the tool
+disabled but owned, so the creator can fix it and request promotion again;
+`disable` hides a tool from new spawns (running workers keep their copy) and
+`enable` restores it without ever bypassing approval. The rest of the admin
+API: `POST /api/tools` (human authoring, incl. extensions),
+`GET /api/tools[/<id>]`, `reject`, `disable`, `enable`,
+`rollback {version}` (any recorded immutable version) and
+`DELETE /api/tools/<id>` — all admin-token only; task tokens get 401.
+
+Limits: 32 tools per conversation, 16 KB per manifest, 64 KB of source per
+version, command tools capped at 120 s per call (30 s default) with output
+truncated at 4000 characters per stream.
+
+Residual risks (unchanged from the isolation model): all tasks share one uid
+and Landlock ABI 4 does not scope signals, so a task can `kill` another
+worker; CPU/memory/pids are capped per container, not per task; outbound
+network is open, so a task can exfiltrate what it can read (its own workspace
+and tool cache); and `/proc/self` is allow-listed for the worker pid only,
+so command-tool children cannot read their own `/proc/self`.
+
+See [isidore/README.md](isidore/README.md#tool-registry) for the full layout,
+admin API and semantics.
 
 ## Notes
 

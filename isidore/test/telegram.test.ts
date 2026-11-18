@@ -7,6 +7,7 @@ import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import { TaskStore, createTask, type Task } from "../src/store.ts";
 import { TelegramBot, deriveWebhookSecret } from "../src/telegram.ts";
+import { ToolRegistry, type ToolInput } from "../src/tools.ts";
 
 type Call = { method: string; body: any };
 
@@ -100,11 +101,12 @@ test("polling mode clears any webhook, then long-polls", async () => {
 });
 
 async function withBot(
-  run: (ctx: { bot: TelegramBot; store: TaskStore; api: Awaited<ReturnType<typeof fakeApi>>; secret: string }) => Promise<void>,
+  run: (ctx: { bot: TelegramBot; store: TaskStore; registry: ToolRegistry; api: Awaited<ReturnType<typeof fakeApi>>; secret: string }) => Promise<void>,
 ): Promise<void> {
   const api = await fakeApi();
   const dir = mkdtempSync(join(tmpdir(), "isidore-telegram-"));
   const store = new TaskStore(dir, 10_000);
+  const registry = new ToolRegistry(join(dir, "tools"), {});
   const runner = {
     create: (prompt: string, overrides: Partial<Task> = {}) => {
       const task = createTask(prompt, overrides);
@@ -116,9 +118,10 @@ async function withBot(
   const bot = new TelegramBot("123:abc", runner as any, store, new Set(["42"]), {
     apiBase: api.base,
     webhookUrl: "https://example.com/telegram/webhook",
+    registry,
   });
   try {
-    await run({ bot, store, api, secret: deriveWebhookSecret("123:abc") });
+    await run({ bot, store, registry, api, secret: deriveWebhookSecret("123:abc") });
   } finally {
     await bot.stop();
     api.server.close();
@@ -188,5 +191,83 @@ test("notify posts each finished task once, only to allowed chats", async () => 
     const foreign = finish(store, createTask("q", { origin: "telegram:666" }));
     await bot.notify(foreign);
     assert.equal(sent().length, 2);
+  });
+});
+
+const toolInput = (name: string): ToolInput => ({
+  name,
+  kind: "command",
+  description: `telegram test tool ${name}`,
+  input_schema: { type: "object", properties: {} },
+  command: { argv: ["echo", "hi"], files: { "run.sh": "#!/bin/sh\necho hi\n" } },
+});
+
+test("/tools lists pending promotions + active globals; /approve uses the shared approval path", async () => {
+  await withBot(async ({ bot, registry, api, secret }) => {
+    const sent = () => api.calls.filter((c) => c.method === "sendMessage");
+    // A pending global (agent-authored), an active global (human-authored),
+    // and an active conversation tool that must NOT be listed.
+    const pending = registry.create(toolInput("pendingtool"), { scope: "global", rootId: "t_a", taskId: "t_a", origin: "task" });
+    registry.requestPromotion(pending.id, "useful for every conversation");
+    const global = registry.create(toolInput("globaltool"), { scope: "global", rootId: null, taskId: null, origin: "human" });
+    const conv = registry.create(toolInput("convtool"), { scope: "conversation", rootId: "t_a", taskId: "t_a", origin: "task" });
+    assert.equal(pending.status, "pending_approval");
+
+    bot.handleWebhook(secret, message("/tools"));
+    await until(() => sent().length === 1);
+    const listing = sent()[0].body.text;
+    assert.match(listing, /Pending approval/);
+    assert.ok(listing.includes(pending.id));
+    assert.ok(listing.includes("pendingtool"));
+    assert.match(listing, /useful for every conversation/);
+    assert.ok(listing.includes(global.id));
+    assert.ok(listing.includes("globaltool"));
+    assert.ok(!listing.includes(conv.id));
+    assert.match(listing, /\/approve <id>/);
+
+    // /approve without an id shows usage; unknown ids are refused.
+    bot.handleWebhook(secret, message("/approve"));
+    await until(() => sent().length === 2);
+    assert.match(sent()[1].body.text, /Usage: \/approve <tool-id>/);
+    bot.handleWebhook(secret, message("/approve tl_nope"));
+    await until(() => sent().length === 3);
+    assert.match(sent()[2].body.text, /Not approved: unknown tool/);
+
+    // The real approval: name + version echoed BEFORE applying, then the
+    // active + global result with ownership cleared.
+    bot.handleWebhook(secret, message(`/approve ${pending.id}`));
+    await until(() => sent().length === 5);
+    assert.match(sent()[3].body.text, new RegExp(`Approving pendingtool v1 \\(${pending.id}\\)`));
+    assert.match(sent()[4].body.text, new RegExp(`Approved ${pending.id} \\(pendingtool v1\\)`));
+    const index = registry.getIndex(pending.id)!;
+    assert.equal(index.status, "active");
+    assert.equal(index.scope, "global");
+    assert.equal(index.owner_root_id, null);
+    assert.equal(index.owner_task_id, null);
+    assert.equal(index.promotion_reason, undefined);
+    // Approving a non-pending tool is refused (after the same echo).
+    bot.handleWebhook(secret, message(`/approve ${global.id}`));
+    await until(() => sent().length === 7);
+    assert.match(sent()[5].body.text, /Approving globaltool v1/);
+    assert.match(sent()[6].body.text, /Not approved.*not pending_approval/);
+  });
+});
+
+test("/tools and /approve are gated to allowed chats", async () => {
+  await withBot(async ({ bot, registry, api, secret }) => {
+    const sent = () => api.calls.filter((c) => c.method === "sendMessage");
+    const pending = registry.create(toolInput("gatedtool"), { scope: "global", rootId: "t_a", taskId: "t_a", origin: "task" });
+    // A chat outside the allow-list is silently ignored…
+    const foreign = (text: string) => ({ update_id: updateId++, message: { chat: { id: 9 }, text } });
+    assert.equal(bot.handleWebhook(secret, foreign("/tools")), true);
+    assert.equal(bot.handleWebhook(secret, foreign(`/approve ${pending.id}`)), true);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(sent().length, 0);
+    // …and the tool is still pending.
+    assert.equal(registry.getIndex(pending.id)?.status, "pending_approval");
+    // The allowed chat works.
+    bot.handleWebhook(secret, message("/tools"));
+    await until(() => sent().length === 1);
+    assert.ok(sent()[0].body.text.includes(pending.id));
   });
 });

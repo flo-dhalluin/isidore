@@ -10,6 +10,8 @@
   aside { position: sticky; top: 2rem; max-height: calc(100dvh - 4rem); overflow-y: auto; }
   h1 { font-size: 1.1rem; letter-spacing: .18em; text-transform: uppercase; margin: 0 0 .25rem; }
   .sub { color: var(--muted); margin: 0 0 1.5rem; font-size: .85rem; }
+  .sub a { color: var(--accent); text-decoration: none; }
+  .sub a:hover { text-decoration: underline; }
   form { border: 1px solid var(--line); padding: 1rem; margin-bottom: 1.5rem; }
   textarea, input { width: 100%; background: transparent; color: inherit; border: 1px solid var(--line);
                     padding: .55rem .6rem; font: inherit; }
@@ -64,7 +66,7 @@
 {% block body %}
 <div class="wrap">
   <h1>isidore</h1>
-  <p class="sub">spawn isolated Pi tasks &middot; <span id="count">0</span> total</p>
+  <p class="sub">spawn isolated Pi tasks &middot; <span id="count">0</span> total &middot; <a id="tools-link" href="/tools">tool registry</a></p>
 
   <div class="layout">
     <main>
@@ -90,6 +92,7 @@
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const TOKEN = new URLSearchParams(location.search).get("token") || "";
+if (TOKEN) { $("tools-link").href = "/tools?token=" + encodeURIComponent(TOKEN); }
 let scheduler = false;
 
 async function api(path, opts) {

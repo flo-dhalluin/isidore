@@ -268,6 +268,10 @@ export function createRegistryExtension(options: RegistryExtensionOptions): Exte
     const live = new Map<string, string>();
 
     const registerManifest = (manifest: ToolManifest, cachePath: string | null): void => {
+      // resolveFor overlays the LIVE index scope/status onto each manifest
+      // (withLiveState), so an approved global arrives here as "active" even
+      // though its immutable version manifest was written "pending_approval".
+      // Same-turn authoring payloads carry the final status from the registry.
       if (manifest.status !== "active") return;
       if (manifest.kind === "mcp") {
         if (!manifest.mcp) return;
