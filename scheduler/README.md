@@ -29,30 +29,30 @@ Pi / isidore ──► schedule_task ──► schedules.json
 combination such as `1h30m`. A one-shot schedule disables itself after it
 fires; an interval schedule advances to the next future occurrence.
 
-Pi connects to the server through `mcp.json`; the sandbox entrypoint adds it
-automatically when `PI_SANDBOX_SCHEDULER_URL` is set:
+Pi reaches the server through the `scheduler` **builtin of isidore's tool
+registry**: when `PI_SANDBOX_SCHEDULER_URL` is set, the runner composes a
+builtin manifest into every spawned task and the worker registers it with
+`pi.registerMcpServer` (there is no shared `mcp.json` any more). The composed
+MCP config is:
 
 ```json
 {
-  "mcpServers": {
-    "scheduler": {
-      "url": "http://scheduler:8940/mcp",
-      "headers": {
-        "X-Isidore-Task-Token": "${ISIDORE_TASK_TOKEN}",
-        "X-Isidore-Origin": "${ISIDORE_TASK_ORIGIN}"
-      },
-      "exposure": "direct",
-      "timeout": 30
-    }
-  }
+  "url": "http://scheduler:8940/mcp",
+  "headers": {
+    "X-Isidore-Task-Token": "${ISIDORE_TASK_TOKEN}",
+    "X-Isidore-Origin": "${ISIDORE_TASK_ORIGIN}"
+  },
+  "exposure": "direct",
+  "timeout": 30
 }
 ```
 
 Pi expands `${ISIDORE_TASK_TOKEN}` and `${ISIDORE_TASK_ORIGIN}` from the calling
-task's environment. The config carries **no admin secret**: `/state/pi/mcp.json`
-is worker-readable, so it must never contain `SCHEDULER_TOKEN`. Instead each
-task presents its own capability token, which the scheduler validates against
-isidore (see [Conversation scoping](#conversation-scoping)).
+task's environment. The config carries **no admin secret**: the builtin
+manifest is composed per spawn from the service-side registry and only ever
+references the task's own env vars, so it must never contain `SCHEDULER_TOKEN`.
+Instead each task presents its own capability token, which the scheduler
+validates against isidore (see [Conversation scoping](#conversation-scoping)).
 
 When `schedule_task` receives `X-Isidore-Origin: telegram:<chat>`, the schedule
 stores it as `reply_to` and fires its tasks with that origin instead of
@@ -114,11 +114,11 @@ docker compose exec scheduler cat /shared/scheduler-token   # or: docker compose
 In standalone dev without a writable `/shared`, the file falls back to
 `$SCHEDULER_STATE/scheduler-token` (or is skipped with a warning — the startup
 log always carries the token). The generated token never reaches task workers:
-`mcp.json` carries only per-task token headers, the runner scrubs `SCHEDULER_*`
-/ `ISIDORE_*` from worker env, and the token file lives outside the workers'
-Landlock allow-list. The MCP endpoint itself is only reachable on the private
-compose network (no published port) and is scoped per task token rather than
-by a shared admin secret.
+the builtin scheduler manifest carries only per-task token headers, the runner
+scrubs `SCHEDULER_*` / `ISIDORE_*` from worker env, and the token file lives
+outside the workers' Landlock allow-list. The MCP endpoint itself is only
+reachable on the private compose network (no published port) and is scoped per
+task token rather than by a shared admin secret.
 
 ## Persistence and failures
 

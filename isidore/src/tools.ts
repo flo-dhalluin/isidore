@@ -11,8 +11,11 @@
  * scheduler, and the informational extension entries) are generated in code
  * from the environment and NEVER persisted.
  *
- * Phase 1: store + builtins only. Nothing here is wired into the runner or
- * worker yet; ResolvedTool.cachePath stays null until the Phase 2 cache copy.
+ * The runner composes each spawn from resolveFor() and copies command sources
+ * into the read-only per-conversation tool-cache (tool-cache.ts). Live state
+ * (scope/status/ownership/current version) lives ONLY on the index; version
+ * manifests are immutable. Human approval (tools-api.ts) is the only path
+ * that makes an agent-authored tool active+global.
  */
 
 import { createHash, randomBytes } from "node:crypto";
@@ -49,6 +52,8 @@ export interface ToolManifest {
   command?: { argv: string[]; files: Record<string, string>; timeout_seconds?: number };
   /** Relative module path; human-only kind. */
   extension?: { entry: string };
+  /** extension sources: relative path -> module text (command sources live in command.files). */
+  files?: Record<string, string>;
   provenance: { task_id: string | null; root_id: string | null; origin: string; created_at: string; sha256: string };
 }
 
@@ -81,6 +86,8 @@ export interface ToolInput {
   mcp?: { url: string; headers?: Record<string, string>; exposure?: "direct" | "codemode" | "deferred"; timeout?: number };
   command?: { argv: string[]; files: Record<string, string>; timeout_seconds?: number };
   extension?: { entry: string };
+  /** extension-only source files (relative path -> text); must include the entry. */
+  files?: Record<string, string>;
 }
 
 /** Who owns a created tool; provenance is derived from this, never from input. */
@@ -123,11 +130,12 @@ const BUILTIN_NAMES: ReadonlySet<string> = new Set(["browser", "scheduler", "too
 
 const NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
 const TOOL_KINDS: ReadonlySet<string> = new Set(["mcp", "command", "extension"]);
+const TOOL_SCOPES: ReadonlySet<string> = new Set(["task", "conversation", "global"]);
 const TOOL_STATUSES: ReadonlySet<string> = new Set(["active", "disabled", "pending_approval"]);
 const MCP_EXPOSURES: ReadonlySet<string> = new Set(["direct", "codemode", "deferred"]);
 /** Shell metacharacters (and whitespace) forbidden in a bare program name. */
 const SHELL_METACHARS = /[|&;<>()$`\\"'*?[\]{}!#~=%\s]/;
-const INPUT_KEYS: ReadonlySet<string> = new Set(["name", "kind", "description", "input_schema", "mcp", "command", "extension"]);
+const INPUT_KEYS: ReadonlySet<string> = new Set(["name", "kind", "description", "input_schema", "mcp", "command", "extension", "files"]);
 const MCP_KEYS: ReadonlySet<string> = new Set(["url", "headers", "exposure", "timeout"]);
 /** RFC 7230 token: the only chars legal in an HTTP header name. */
 const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
@@ -168,11 +176,30 @@ function provenanceHash(input: ToolInput): string {
     return sha256(canonicalJson({ url: input.mcp?.url ?? "", headers: input.mcp?.headers ?? {} }));
   }
   const files: Record<string, string> = {};
-  for (const [name, content] of Object.entries(input.command?.files ?? {})) files[name] = sha256(content);
+  const sources = input.kind === "extension" ? (input.files ?? input.command?.files ?? {}) : (input.command?.files ?? {});
+  for (const [name, content] of Object.entries(sources)) files[name] = sha256(content);
   if (input.kind === "extension") {
     return sha256(canonicalJson({ entry: input.extension?.entry ?? "", files }));
   }
   return sha256(canonicalJson({ files }));
+}
+
+/** Source-file map validation shared by command.files and extension files. */
+function assertSourceFiles(files: unknown, label: string): Record<string, string> {
+  if (!files || typeof files !== "object" || Array.isArray(files)) {
+    throw new Error(`${label} must be an object mapping relative paths to source text`);
+  }
+  const record = files as Record<string, unknown>;
+  const names = Object.keys(record);
+  if (names.length > MAX_TOOL_FILES) throw new Error(`too many tool files (max ${MAX_TOOL_FILES})`);
+  let total = 0;
+  for (const [name, content] of Object.entries(record)) {
+    assertRelativePath(name, label);
+    if (typeof content !== "string") throw new Error(`${label}[${name}] must be a string`);
+    total += Buffer.byteLength(content, "utf8");
+  }
+  if (total > MAX_SOURCE_BYTES) throw new Error(`tool sources exceed ${MAX_SOURCE_BYTES} bytes`);
+  return record as Record<string, string>;
 }
 
 /** Relative path only: no absolute paths, no ".."/"." segments, no backslashes. */
@@ -272,19 +299,7 @@ export function validateToolInput(input: ToolInput, opts: { allowExtension: bool
         throw new Error(`malformed argv placeholder in: ${token}`);
       }
     }
-    const files = command.files;
-    if (!files || typeof files !== "object" || Array.isArray(files)) {
-      throw new Error("command.files must be an object mapping relative paths to source text");
-    }
-    const names = Object.keys(files);
-    if (names.length > MAX_TOOL_FILES) throw new Error(`too many tool files (max ${MAX_TOOL_FILES})`);
-    let total = 0;
-    for (const [name, content] of Object.entries(files)) {
-      assertRelativePath(name, "command.files");
-      if (typeof content !== "string") throw new Error(`command.files[${name}] must be a string`);
-      total += Buffer.byteLength(content, "utf8");
-    }
-    if (total > MAX_SOURCE_BYTES) throw new Error(`tool sources exceed ${MAX_SOURCE_BYTES} bytes`);
+    assertSourceFiles(command.files, "command.files");
     if (command.timeout_seconds !== undefined) assertTimeout(command.timeout_seconds, "command.timeout_seconds");
   } else if (input.command !== undefined) {
     throw new Error("command block is only valid for command tools");
@@ -333,9 +348,29 @@ export function validateToolInput(input: ToolInput, opts: { allowExtension: bool
   if (input.kind === "extension") {
     if (!input.extension || typeof input.extension !== "object") throw new Error("extension tools require an extension block");
     assertRelativePath(input.extension.entry, "extension.entry");
-  } else if (input.extension !== undefined) {
-    throw new Error("extension block is only valid for extension tools");
+    if (input.files !== undefined) {
+      const files = assertSourceFiles(input.files, "files");
+      // An extension whose entry is not among its sources could never load.
+      if (!(input.extension.entry in files)) {
+        throw new Error(`files must include the extension entry (${input.extension.entry})`);
+      }
+    }
+  } else {
+    if (input.extension !== undefined) throw new Error("extension block is only valid for extension tools");
+    if (input.files !== undefined) throw new Error("files is only valid for extension tools (command sources live in command.files)");
   }
+}
+
+/**
+ * Manifest with the LIVE index state overlaid. Version manifests are
+ * immutable: they carry the scope/status as written at authoring time, which
+ * goes stale as soon as the index changes (approval flips a pending global to
+ * active+global; a version written while disabled carries status:"disabled").
+ * Composition (resolveFor) and the admin API therefore overlay the index's
+ * scope/status; provenance, version and everything else stay immutable.
+ */
+export function withLiveState(manifest: ToolManifest, index: ToolIndex): ToolManifest {
+  return { ...manifest, scope: index.scope, status: index.status };
 }
 
 const BROWSER_DESCRIPTION = "Headless Firefox: open pages, read and interact with them, fill forms, take screenshots";
@@ -535,6 +570,36 @@ export class ToolRegistry {
     }
   }
 
+  /**
+   * Phase 4 approval re-check: the name must be free among ACTIVE globals +
+   * builtins (with MCP-namespace normalization) right before a pending tool
+   * becomes active+global. Two conversations may hold same-name pending
+   * globals (no cross-conversation squatting at authoring time), so the
+   * authoring-time check alone is not enough — approval re-checks and the
+   * second approval of a colliding name is refused with 409.
+   */
+  assertGlobalNameAvailable(name: string, excludeId: string | null): void {
+    if (RESERVED_TOOL_NAMES.has(name) || BUILTIN_NAMES.has(name)) {
+      throw new Error(`tool name "${name}" is reserved`);
+    }
+    const normalized = mcpNamespaceKey(name);
+    for (const builtin of BUILTIN_NAMES) {
+      if (mcpNamespaceKey(builtin) === normalized) {
+        throw new Error(`tool name "${name}" collides with builtin "${builtin}" after MCP namespace normalization (- and _ are equivalent)`);
+      }
+    }
+    for (const index of this.indexes.values()) {
+      if (index.id === excludeId) continue;
+      if (!(index.scope === "global" && index.status === "active")) continue;
+      if (index.name === name) {
+        throw new Error(`tool name "${name}" already exists as an active global tool`);
+      }
+      if (mcpNamespaceKey(index.name) === normalized) {
+        throw new Error(`tool name "${name}" collides with active global "${index.name}" after MCP namespace normalization (- and _ are equivalent)`);
+      }
+    }
+  }
+
   create(
     input: ToolInput,
     owner: ToolOwner,
@@ -543,6 +608,13 @@ export class ToolRegistry {
     validateToolInput(input, { allowExtension: opts.allowExtension ?? false });
     if (owner.scope === "conversation" && !owner.rootId) throw new Error("conversation scope requires a rootId");
     if (owner.scope === "task" && (!owner.rootId || !owner.taskId)) throw new Error("task scope requires rootId and taskId");
+    // Defense in depth: a global born pending_approval MUST keep creator
+    // ownership. An unowned pending global, once rejected, would be a
+    // disabled UNOWNED global that enable() could activate without approval.
+    const bornPending = owner.scope === "global" && (owner.origin !== "human" || opts.forcePendingApproval);
+    if (bornPending && (!owner.rootId || !owner.taskId)) {
+      throw new Error("a pending global tool requires creator rootId and taskId (ownership is kept until human approval)");
+    }
     this.assertNameAvailable(input.name, owner, null);
     // Quota counts ALL indexes owned by the conversation — including its
     // pending globals (ownership is kept until human approval), so pending
@@ -581,12 +653,13 @@ export class ToolRegistry {
       },
     };
     this.assertManifestSize(manifest);
-    this.writeVersion(manifest, input.command?.files ?? {});
+    this.writeVersion(manifest, input.command?.files ?? input.files ?? {});
     // PENDING globals KEEP creator ownership: the creator can still see and
     // manage them (withdraw/update/disable/remove), they count against its
     // quota, and they stay invisible to every other conversation. Ownership
     // is cleared ONLY when a human approval makes the tool active+global
-    // (Phase 4 approve() calls clearOwnership()). Active globals are unowned.
+    // (registry.approve() does it atomically with activation). Active globals
+    // are unowned.
     const pendingGlobal = owner.scope === "global" && status === "pending_approval";
     const index: ToolIndex = {
       id,
@@ -594,7 +667,10 @@ export class ToolRegistry {
       scope: owner.scope,
       status,
       owner_root_id: owner.scope === "global" && !pendingGlobal ? null : owner.rootId,
-      owner_task_id: owner.scope === "task" || pendingGlobal ? owner.taskId : null,
+      // Every OWNED tool (task, conversation, pending global) records the
+      // authoring task, so reject/disable keep full ownership and the creator
+      // can revise + re-promote. Only unowned active globals carry null.
+      owner_task_id: owner.scope === "global" && !pendingGlobal ? null : owner.taskId,
       current_version: 1,
       versions: [1],
     };
@@ -653,7 +729,7 @@ export class ToolRegistry {
       if (manifest[key] === undefined) delete manifest[key];
     }
     this.assertManifestSize(manifest);
-    this.writeVersion(manifest, input.command?.files ?? {});
+    this.writeVersion(manifest, input.command?.files ?? input.files ?? {});
     index.name = input.name;
     index.current_version = version;
     index.versions.push(version);
@@ -711,10 +787,41 @@ export class ToolRegistry {
   }
 
   /**
-   * Clear creator ownership. Phase 4's human approval calls this when a
-   * pending global becomes active+global: the owner fields go null so no
-   * conversation keeps visibility, mutation rights or quota over it. Kept
-   * separate from setStatus so approval is an explicit, deliberate step.
+   * Change the live scope (index only; version manifests stay immutable).
+   * Phase 4's human approval uses this to make a pending tool global.
+   */
+  setScope(id: string, scope: ToolScope): boolean {
+    if (!TOOL_SCOPES.has(scope)) throw new Error(`invalid tool scope: ${scope}`);
+    const index = this.indexes.get(id);
+    if (!index) return false;
+    index.scope = scope;
+    this.writeIndex(index);
+    return true;
+  }
+
+  /**
+   * Human approval (Phase 4): pending_approval -> active AND scope global AND
+   * creator ownership cleared AND promotion reason dropped — in ONE atomic
+   * index write. A multi-write sequence (setStatus -> setScope ->
+   * clearOwnership) could crash mid-way and leave an active+global tool still
+   * owned by its creator conversation (which would keep canMutate over a live
+   * global). The caller (approvePromotion) re-checks name collisions first.
+   */
+  approve(id: string): boolean {
+    const index = this.indexes.get(id);
+    if (!index) return false;
+    index.status = "active";
+    index.scope = "global";
+    index.owner_root_id = null;
+    index.owner_task_id = null;
+    delete index.promotion_reason;
+    this.writeIndex(index);
+    return true;
+  }
+
+  /**
+   * Clear creator ownership on its own (tests/repair). Human approval uses
+   * approve() instead, which clears ownership atomically with activation.
    */
   clearOwnership(id: string): boolean {
     const index = this.indexes.get(id);
@@ -806,7 +913,12 @@ export class ToolRegistry {
         warnings.push(`tool ${index.id} has no readable manifest`);
         continue;
       }
-      push(manifest);
+      // Overlay the LIVE scope/status: the immutable manifest may carry a
+      // stale authoring-time status (e.g. "pending_approval" for an approved
+      // global, or "disabled" for a version written while rejected). The
+      // worker's registration guards key off manifest.status, so without
+      // this overlay approved tools would be composed but never registered.
+      push(withLiveState(manifest, index));
       seenIds.add(index.id);
     }
     for (const pin of opts.inherited ?? []) {
@@ -825,7 +937,7 @@ export class ToolRegistry {
         warnings.push(`pinned tool ${pin.id} version ${pin.version} is missing`);
         continue;
       }
-      push(manifest);
+      push(withLiveState(manifest, index));
       seenIds.add(pin.id);
     }
     for (const manifest of builtinManifests(this.env, this.port)) {

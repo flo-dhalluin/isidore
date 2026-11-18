@@ -11,6 +11,7 @@ import { renderTemplate } from "./templates.ts";
 import { TokenRegistry } from "./tokens.ts";
 import { ToolRegistry } from "./tools.ts";
 import { removeToolCacheCopies } from "./tool-cache.ts";
+import { registerToolsApi } from "./tools-api.ts";
 import { registerToolsMcp } from "./tools-mcp.ts";
 
 const MAX_PROMPT = 100_000;
@@ -60,6 +61,7 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
     bot = new TelegramBot(settings.telegramToken, runner, store, settings.telegramChats, {
       webhookUrl: settings.telegramWebhookUrl,
       webhookSecret: settings.telegramWebhookSecret,
+      registry,
     });
     void bot.run();
   }
@@ -69,6 +71,10 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
   // Tools authoring MCP (Phase 3): stateless streamable-HTTP JSON-RPC, scoped
   // to the caller's conversation via the same resolveAuth as the REST API.
   registerToolsMcp(app, { registry, tokens, adminToken, toolCacheRoot });
+
+  // Human admin surface (Phase 4): /api/tools is ADMIN-ONLY (task tokens get
+  // 401). Approval here is the only path that makes a tool active+global.
+  registerToolsApi(app, { registry, tokens, adminToken, toolCacheRoot });
 
   // UI routes are admin-only; the token is never injected into the HTML (workers
   // share isidore's network namespace and could harvest it from loopback).
@@ -82,6 +88,12 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
     const auth = resolveAuth(request, adminToken, tokens);
     if (auth?.kind !== "admin") return reply.code(401).type("text/plain").send("unauthorised");
     return reply.type("text/html").send(renderTemplate("task.html"));
+  });
+
+  app.get("/tools", async (request, reply) => {
+    const auth = resolveAuth(request, adminToken, tokens);
+    if (auth?.kind !== "admin") return reply.code(401).type("text/plain").send("unauthorised");
+    return reply.type("text/html").send(renderTemplate("tools.html"));
   });
 
   // Telegram webhook: authenticated by the secret token Telegram echoes back,

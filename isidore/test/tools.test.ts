@@ -169,8 +169,9 @@ test("disabled and pending_approval tools are not resolved", () => {
     assert.ok(!pinned.some((tool) => tool.manifest.id === disabled.id));
     registry.setStatus(disabled.id, "active");
     assert.ok(names(registry.resolveFor({ rootId: "t_a", taskId: "t_a-task" })).includes("offtool"));
-    // Agent-authored globals start pending; human-authored globals are active.
-    const agentGlobal = registry.create(commandInput("agentglobal"), { scope: "global", rootId: null, taskId: "t_a-task", origin: "task" });
+    // Agent-authored globals start pending (and KEEP creator ownership);
+    // human-authored globals are active.
+    const agentGlobal = registry.create(commandInput("agentglobal"), { scope: "global", rootId: "t_a", taskId: "t_a-task", origin: "task" });
     assert.equal(agentGlobal.status, "pending_approval");
     assert.ok(!names(registry.resolveFor({ rootId: "t_a", taskId: "t_a-task" })).includes("agentglobal"));
   } finally {
@@ -668,6 +669,164 @@ test("stageToolCache drops the copy when the tool was removed/disabled between r
     stageToolCache(registry, cache, "t_a", resolved3);
     assert.equal(resolved3[0].cachePath, join(cache, "t_a", fine.id, "1"));
     assert.ok(existsSync(join(resolved3[0].cachePath!, "run.sh")));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("resolveFor overlays LIVE index scope/status onto immutable manifests", () => {
+  const dir = tempDir();
+  try {
+    const registry = new ToolRegistry(dir, {});
+    // An agent-authored global is born pending_approval in its IMMUTABLE manifest.
+    const pending = registry.create(commandInput("approvedlater"), { scope: "global", rootId: "t_a", taskId: "t_a-task", origin: "task" });
+    assert.equal(pending.status, "pending_approval");
+    registry.requestPromotion(pending.id, "share it");
+    registry.approve(pending.id);
+    // The on-disk version manifest STILL says pending_approval (immutable)…
+    const onDisk = JSON.parse(readFileSync(join(dir, pending.id, "1", "manifest.json"), "utf8"));
+    assert.equal(onDisk.status, "pending_approval");
+    assert.equal(onDisk.scope, "global");
+    // …but resolution overlays the live index state, so the worker's
+    // status==="active" registration guard passes.
+    const resolved = registry.resolveFor({ rootId: "t_unrelated", taskId: "t_unrelated-task" });
+    const tool = resolved.find((entry) => entry.manifest.id === pending.id);
+    assert.ok(tool, "approved global must resolve for unrelated conversations");
+    assert.equal(tool!.manifest.status, "active");
+    assert.equal(tool!.manifest.scope, "global");
+    assert.equal(tool!.manifest.version, 1); // provenance/version untouched
+    assert.deepEqual(tool!.manifest.provenance, pending.provenance);
+
+    // A version written while DISABLED (reject -> revise) carries the stale
+    // status/scope too; after re-promotion + approval the overlay fixes both.
+    const conv = registry.create(commandInput("reviseme"), convOwner("t_b"));
+    registry.requestPromotion(conv.id, "please");
+    registry.setStatus(conv.id, "disabled"); // reject
+    const v2 = registry.update(conv.id, commandInput("reviseme", { description: "revised" }));
+    assert.equal(v2.status, "disabled");
+    assert.equal(v2.scope, "conversation");
+    registry.requestPromotion(conv.id, "revised");
+    registry.approve(conv.id);
+    const resolved2 = registry.resolveFor({ rootId: "t_other", taskId: "t_other-task" });
+    const tool2 = resolved2.find((entry) => entry.manifest.id === conv.id);
+    assert.ok(tool2);
+    assert.equal(tool2!.manifest.version, 2);
+    assert.equal(tool2!.manifest.status, "active");
+    assert.equal(tool2!.manifest.scope, "global");
+    // Pinned inherited versions get the same overlay: a version written while
+    // disabled, re-enabled afterwards, resolves as active for the child even
+    // though the pinned manifest itself says disabled. (The tool stays
+    // conversation-scoped and owned by t_b, so ONLY the pin path reaches it.)
+    const pinnable = registry.create(commandInput("pinme"), convOwner("t_b"));
+    registry.setStatus(pinnable.id, "disabled");
+    const pv2 = registry.update(pinnable.id, commandInput("pinme", { description: "v2 while disabled" }));
+    assert.equal(pv2.status, "disabled");
+    registry.setStatus(pinnable.id, "active"); // enable
+    const pinned = registry.resolveFor({ rootId: "t_child", taskId: "t_child-task", inherited: [{ id: pinnable.id, version: 2 }] });
+    const pin = pinned.find((entry) => entry.manifest.id === pinnable.id);
+    assert.ok(pin);
+    assert.equal(pin!.manifest.version, 2);
+    assert.equal(pin!.manifest.status, "active");
+    assert.equal(pin!.manifest.scope, "conversation");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("approve() writes active + global + unowned in ONE consistent index record", () => {
+  const dir = tempDir();
+  try {
+    const registry = new ToolRegistry(dir, {});
+    const pending = registry.create(commandInput("atomic"), { scope: "global", rootId: "t_a", taskId: "t_a-task", origin: "task" });
+    registry.requestPromotion(pending.id, "why not");
+    assert.equal(registry.approve(pending.id), true);
+    assert.equal(registry.approve("tl_missing"), false);
+    // Read the RAW on-disk record: every approval effect must be present in
+    // the same single write (no crash window with an owned active global).
+    const raw = JSON.parse(readFileSync(join(dir, pending.id, "index.json"), "utf8"));
+    assert.equal(raw.status, "active");
+    assert.equal(raw.scope, "global");
+    assert.equal(raw.owner_root_id, null);
+    assert.equal(raw.owner_task_id, null);
+    assert.equal(raw.promotion_reason, undefined);
+    assert.equal(raw.current_version, 1);
+    // A fresh registry (restart) sees the same consistent record.
+    const reloaded = new ToolRegistry(dir, {});
+    const index = reloaded.getIndex(pending.id)!;
+    assert.equal(index.status, "active");
+    assert.equal(index.scope, "global");
+    assert.equal(index.owner_root_id, null);
+    assert.equal(index.owner_task_id, null);
+    // The creator no longer has mutation rights (ownership gone).
+    assert.equal(reloaded.list({ owner_root_id: "t_a" }).length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("create() refuses unowned pending globals (non-human origin or forced approval)", () => {
+  const dir = tempDir();
+  try {
+    const registry = new ToolRegistry(dir, {});
+    // Non-human global without owner ids would become an UNOWNED disabled
+    // global after reject, which enable() could activate without approval.
+    assert.throws(
+      () => registry.create(commandInput("noowner"), { scope: "global", rootId: null, taskId: null, origin: "task" }),
+      /requires creator rootId and taskId/,
+    );
+    assert.throws(
+      () => registry.create(commandInput("halfowner"), { scope: "global", rootId: "t_a", taskId: null, origin: "task" }),
+      /requires creator rootId and taskId/,
+    );
+    // forcePendingApproval (task token with a "human" origin string) too.
+    assert.throws(
+      () => registry.create(commandInput("forced"), { scope: "global", rootId: null, taskId: null, origin: "human" }, { forcePendingApproval: true }),
+      /requires creator rootId and taskId/,
+    );
+    // Owned pending globals and human globals remain fine.
+    const owned = registry.create(commandInput("ownedpending"), { scope: "global", rootId: "t_a", taskId: "t_a-task", origin: "task" });
+    assert.equal(owned.status, "pending_approval");
+    const human = registry.create(commandInput("humanglobal"), humanOwner);
+    assert.equal(human.status, "active");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("extension tools carry source files (validated, hashed, staged)", () => {
+  const dir = tempDir();
+  try {
+    const registry = new ToolRegistry(dir, {});
+    const ext: ToolInput = {
+      name: "humanext",
+      kind: "extension",
+      description: "a human extension",
+      extension: { entry: "ext.ts" },
+      files: { "ext.ts": "export default () => {};\n", "lib/helper.ts": "export const x = 1;\n" },
+    };
+    validateToolInput(ext, { allowExtension: true });
+    // files is extension-only; command sources stay in command.files.
+    assert.throws(() => validateToolInput({ ...commandInput("cmd"), files: { "a.ts": "x" } }, { allowExtension: true }), /only valid for extension/);
+    // Path traversal, oversized and entry-missing file maps are rejected.
+    assert.throws(() => validateToolInput({ ...ext, files: { "../evil.ts": "x" } }, { allowExtension: true }), /path/);
+    assert.throws(() => validateToolInput({ ...ext, files: { "other.ts": "x" } }, { allowExtension: true }), /must include the extension entry/);
+    assert.throws(() => validateToolInput({ ...ext, files: { "ext.ts": "x".repeat(MAX_SOURCE_BYTES + 1) } }, { allowExtension: true }), /sources exceed/);
+    const manifest = registry.create(ext, humanOwner, { allowExtension: true });
+    assert.equal(manifest.kind, "extension");
+    assert.equal(manifest.status, "active");
+    assert.match(manifest.provenance.sha256, /^[0-9a-f]{64}$/);
+    assert.equal(readFileSync(join(dir, manifest.id, "1", "files", "ext.ts"), "utf8"), "export default () => {};\n");
+    assert.ok(existsSync(join(dir, manifest.id, "1", "files", "lib", "helper.ts")));
+    // Sources stage into the tool-cache like command files.
+    const cache = join(dir, "cache");
+    const resolved: ResolvedTool[] = [{ manifest, cachePath: null }];
+    stageToolCache(registry, cache, "t_a", resolved);
+    assert.equal(resolved[0].cachePath, join(cache, "t_a", manifest.id, "1"));
+    assert.ok(existsSync(join(resolved[0].cachePath!, "ext.ts")));
+    // Extension without files stays legal at the registry level (inert until
+    // sources exist); the admin API requires files separately.
+    const bare = registry.create({ name: "bareext", kind: "extension", description: "d", extension: { entry: "e.ts" } }, humanOwner, { allowExtension: true });
+    assert.equal(bare.kind, "extension");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
