@@ -13,6 +13,7 @@
  * unchanged.
  */
 
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   createAgentSession,
@@ -29,6 +30,8 @@ import {
   type AgentSessionEvent,
 } from "@earendil-works/pi-coding-agent";
 import { scrubEnv } from "./env-scrub.ts";
+import { createRegistryExtension } from "./registry-extension.ts";
+import type { ResolvedTool } from "./tools.ts";
 
 interface WorkerRequest {
   prompt: string;
@@ -37,6 +40,8 @@ interface WorkerRequest {
   thinkingLevel?: string | null;
   /** OpenRouter key from the runner's stdin request (never in the exec env). */
   apiKey?: string | null;
+  /** Tool set composed by the runner at spawn (Phase 2). */
+  tools?: ResolvedTool[];
 }
 
 /** Mirror the CLI's JSON-mode transformation: strip cumulative snapshots. */
@@ -127,13 +132,34 @@ async function main(): Promise<number> {
   // SDK does not. Add them so MCP servers (browser + scheduler) still work.
   // The inline bash override re-registers the built-in bash tool with a
   // spawnHook that scrubs secrets from every command's environment.
+  //
+  // MCP servers come ONLY from the registry extension's pi.registerMcpServer
+  // calls (Phase 2): loadConfig is overridden so neither the shared agent-dir
+  // mcp.json nor a task-written <workspace>/.pi/mcp.json can shadow or add
+  // servers. Human-authored extension tools (kind extension with an entry and
+  // a tool-cache copy) load as regular extension modules.
+  const tools = request.tools ?? [];
+  // Defense in depth: only HUMAN-authored extension modules are loaded, on
+  // top of validateToolInput's human-only gating at authoring time.
+  const additionalExtensionPaths = tools
+    .filter(
+      (tool) =>
+        tool.manifest.kind === "extension" &&
+        tool.manifest.status === "active" &&
+        tool.manifest.provenance.origin === "human" &&
+        tool.manifest.extension?.entry &&
+        tool.cachePath &&
+        existsSync(join(tool.cachePath, tool.manifest.extension.entry)),
+    )
+    .map((tool) => join(tool.cachePath!, tool.manifest.extension!.entry));
   const resourceLoader = new DefaultResourceLoader({
     cwd,
     agentDir,
+    additionalExtensionPaths,
     extensionFactories: [
       createCodemodeExtension(),
       createToolSearchExtension(),
-      createMcpExtension(),
+      createMcpExtension({ loadConfig: () => ({ servers: [], errors: [] }) }),
       (pi) => {
         pi.registerTool(
           createBashToolDefinition(cwd, {
@@ -141,6 +167,7 @@ async function main(): Promise<number> {
           }),
         );
       },
+      createRegistryExtension({ tools, cwd }),
     ],
   });
   await resourceLoader.reload();
