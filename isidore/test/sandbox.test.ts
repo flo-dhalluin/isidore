@@ -6,7 +6,7 @@
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -204,5 +204,46 @@ test("launcher edge cases: missing workspace, missing command, unknown flag, opt
     assert.match(optional.stderr, /warning: skipping/);
   } finally {
     rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test("7: tool-cache is readable+executable but not writable; /state/tools stays denied", () => {
+  const ws = tempDir("isidore-sb-ws-");
+  const state = tempDir("isidore-sb-state-");
+  try {
+    // Mimic the service layout: registry sources (service-only) and the
+    // per-conversation read-only cache copy the runner stages at spawn.
+    const tools = join(state, "tools", "tl_0123456789ab", "1", "files");
+    const cache = join(state, "tool-cache", "t_conv", "tl_0123456789ab", "1");
+    mkdirSync(tools, { recursive: true });
+    mkdirSync(cache, { recursive: true });
+    writeFileSync(join(tools, "run.sh"), "#!/bin/sh\necho source\n");
+    writeFileSync(join(cache, "run.sh"), "#!/bin/sh\necho cached\n");
+    chmodSync(join(cache, "run.sh"), 0o755);
+    const script = [
+      `if cat ${join(cache, "run.sh")} >/dev/null 2>&1; then echo cache-read-ok; else echo cache-read-denied; fi`,
+      // --rx lets a cached shebang script run directly as argv[0].
+      `if out=$(${join(cache, "run.sh")} 2>/dev/null) && [ "$out" = "cached" ]; then echo cache-exec-ok; else echo cache-exec-denied; fi`,
+      `if echo x > ${join(cache, "new.txt")} 2>/dev/null; then echo cache-write-leak; else echo cache-write-denied; fi`,
+      `if cat ${join(tools, "run.sh")} >/dev/null 2>&1; then echo tools-read-leak; else echo tools-read-denied; fi`,
+      `if echo x > ${join(state, "tools", "new.txt")} 2>/dev/null; then echo tools-write-leak; else echo tools-write-denied; fi`,
+    ].join("\n");
+    const result = sandbox([
+      ...buildSandboxArgs(ws, [], [join(state, "tool-cache", "t_conv")]),
+      "--rw", "/dev/null",
+      "--", "/bin/sh", "-c", script,
+    ]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /cache-read-ok/);
+    assert.match(result.stdout, /cache-exec-ok/);
+    assert.match(result.stdout, /cache-write-denied/);
+    assert.match(result.stdout, /tools-read-denied/);
+    assert.match(result.stdout, /tools-write-denied/);
+    assert.ok(!result.stdout.includes("leak"));
+    assert.ok(!existsSync(join(cache, "new.txt")));
+    assert.ok(!existsSync(join(state, "tools", "new.txt")));
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+    rmSync(state, { recursive: true, force: true });
   }
 });
