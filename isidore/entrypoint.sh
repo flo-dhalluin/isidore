@@ -6,7 +6,7 @@ set -eu
 export HOME="${HOME:-/state/home}"
 : "${PI_CODING_AGENT_DIR:=/state/pi}"
 export PI_CODING_AGENT_DIR
-mkdir -p "$HOME" "$PI_CODING_AGENT_DIR" 2>/dev/null || true
+mkdir -p "$HOME" "$PI_CODING_AGENT_DIR" "${ISIDORE_STATE:-/state}/shared" 2>/dev/null || true
 
 # The credential arrives as a compose secret (a file), then becomes an env
 # var only inside this process tree. Spawned `pi` processes inherit it.
@@ -41,17 +41,13 @@ else
 fi
 
 if [ -n "${PI_SANDBOX_SCHEDULER_URL:-}" ]; then
-	if [ -n "${ISIDORE_SCHEDULER_TOKEN:-}" ]; then
-		jq --arg url "$PI_SANDBOX_SCHEDULER_URL" --arg token "$ISIDORE_SCHEDULER_TOKEN" '.mcpServers.scheduler = {
-			url: $url, headers: {Authorization: ("Bearer " + $token), "X-Isidore-Origin": "${ISIDORE_TASK_ORIGIN}"}, exposure: "direct", timeout: 30,
-			description: "Schedule one-shot or recurring tasks that spawn isolated Pi agents"
-		}' "$mcp_file" >"$mcp_file.tmp" && mv "$mcp_file.tmp" "$mcp_file"
-	else
-		jq --arg url "$PI_SANDBOX_SCHEDULER_URL" '.mcpServers.scheduler = {
-			url: $url, headers: {"X-Isidore-Origin": "${ISIDORE_TASK_ORIGIN}"}, exposure: "direct", timeout: 30,
-			description: "Schedule one-shot or recurring tasks that spawn isolated Pi agents"
-		}' "$mcp_file" >"$mcp_file.tmp" && mv "$mcp_file.tmp" "$mcp_file"
-	fi
+	# Task-token auth only: mcp.json is worker-readable, so it must contain no
+	# admin secret. Pi expands ${VAR} from each worker's env; the runner mints
+	# ISIDORE_TASK_TOKEN per task and sets ISIDORE_TASK_ORIGIN.
+	jq --arg url "$PI_SANDBOX_SCHEDULER_URL" '.mcpServers.scheduler = {
+		url: $url, headers: {"X-Isidore-Task-Token": "${ISIDORE_TASK_TOKEN}", "X-Isidore-Origin": "${ISIDORE_TASK_ORIGIN}"}, exposure: "direct", timeout: 30,
+		description: "Schedule one-shot or recurring tasks that spawn isolated Pi agents"
+	}' "$mcp_file" >"$mcp_file.tmp" && mv "$mcp_file.tmp" "$mcp_file"
 else
 	jq 'del(.mcpServers.scheduler)' "$mcp_file" >"$mcp_file.tmp" && mv "$mcp_file.tmp" "$mcp_file"
 fi

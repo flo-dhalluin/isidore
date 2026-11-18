@@ -1,6 +1,17 @@
 # syntax=docker/dockerfile:1
 # isidore: a small web service that runs isolated Pi coding-agent tasks.
 # It runs the Pi TypeScript SDK in-process per task (no `pi` CLI subprocess).
+
+# Build the Landlock launcher (isidore/sandbox) in a separate stage so the
+# final image carries only the small static-ish binary, no toolchain.
+FROM debian:bookworm-slim AS sandbox-build
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gcc make libc6-dev linux-libc-dev \
+ && rm -rf /var/lib/apt/lists/*
+COPY sandbox/ /src/sandbox/
+RUN make -C /src/sandbox
+
 FROM node:24-bookworm-slim
 
 ARG PI_VERSION
@@ -39,6 +50,11 @@ COPY templates ./templates
 RUN npm run build && npm prune --omit=dev
 
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/isidore-entry
+COPY --from=sandbox-build /src/sandbox/isidore-sandbox /usr/local/bin/isidore-sandbox
+
+# Pre-create the admin-token volume mountpoint owned by the runtime user so a
+# fresh named volume (isidore-admin) inherits uid-1000 ownership.
+RUN mkdir -p /state/shared && chown 1000:1000 /state/shared
 
 ENV NODE_ENV=production \
     HOME=/state/home \
@@ -46,6 +62,7 @@ ENV NODE_ENV=production \
     ISIDORE_STATE=/state \
     ISIDORE_HOST=0.0.0.0 \
     ISIDORE_PORT=8920 \
+    ISIDORE_SANDBOX_BIN=/usr/local/bin/isidore-sandbox \
     ISIDORE_WORKER_SCRIPT=/opt/isidore/dist/worker.js
 
 EXPOSE 8920

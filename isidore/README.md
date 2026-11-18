@@ -55,6 +55,7 @@ REST API:
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/info` | feature flags (scheduler, telegram, model) |
+| `GET` | `/api/auth/whoami` | caller identity: `{admin:true}` or `{task_id, root_id, origin}` |
 | `GET` | `/api/tasks?limit=50&status=running` | list tasks |
 | `POST` | `/api/tasks` | `{prompt, model?, origin?, schedule_id?}` → 202 |
 | `GET` | `/api/tasks/{id}` | one task, including output |
@@ -67,9 +68,45 @@ REST API:
 | `DELETE` | `/api/schedules/{id}` | proxy to the scheduler |
 | `GET` | `/healthz` | liveness |
 
-Set `ISIDORE_TOKEN` to require `Authorization: Bearer <token>` (or
-`?token=<token>` for the UI). The compose port is loopback-only; use a reverse
-proxy for remote access.
+### Authentication
+
+Every API/UI request needs `Authorization: Bearer <token>`. Two kinds of token
+are accepted:
+
+* **Admin token** — full access. `?token=<token>` also works, but is
+  **admin-only** (it is how the browser UI authenticates). Set `ISIDORE_TOKEN`
+  to choose your own; otherwise isidore **generates one at startup**, logs it
+  loudly to stderr, and writes it to `<stateDir>/shared/admin-token` (mode
+  0600). Retrieve it out-of-band:
+
+  ```sh
+  docker compose exec isidore cat /state/shared/admin-token
+  # or read it from the startup log: docker compose logs isidore
+  ```
+
+  then open `http://127.0.0.1:8920/?token=<TOKEN>`. In dev (no compose) the file
+  is `<ISIDORE_STATE>/shared/admin-token`.
+
+  > **Note:** the shared token volumes are pre-created owned by uid 1000, so the
+  > bootstrap assumes the default `PI_UID`/`PI_GID` (1000). If you override them,
+  > ensure the `isidore-admin` and `scheduler-auth` volumes are writable by that
+  > uid, or set `ISIDORE_TOKEN`/`SCHEDULER_TOKEN` explicitly.
+
+  The token is deliberately **not** injected into the loopback UI: workers
+  share isidore's network namespace, so a task could `curl` loopback and
+  harvest an injected admin token. Out-of-band retrieval keeps it away from
+  tasks.
+
+* **Task token** — a per-task capability the runner mints at spawn
+  (`ISIDORE_TASK_TOKEN`, 64 hex chars) and revokes when the task finishes. It
+  is accepted as a Bearer only (never `?token=`) and is scoped to the task's
+  **conversation** (`root_id`): it can list/read/continue/cancel/delete only
+  that conversation's turns, and create only follow-up turns of it. Any
+  cross-conversation read or action returns **404**; no/invalid token returns
+  **401**. `GET /api/auth/whoami` reports the scope. The scheduler validates
+  task tokens through this endpoint — it never trusts a self-asserted header.
+
+The compose port is loopback-only; use a reverse proxy for remote access.
 
 ## Telegram
 
@@ -111,9 +148,12 @@ their results go back to the chat.
 | `ISIDORE_PI_MODE` | `print` | `print` (final answer) or `json` (full transcript); the worker always emits the event stream, so tool calls are captured either way |
 | `ISIDORE_WORKER_SCRIPT` | `dist/worker.js` | Node worker that runs the Pi SDK |
 | `ISIDORE_WORKER_BIN` | `process.execPath` | Node binary used to run the worker |
-| `ISIDORE_TOKEN` | none | bearer token for the API/UI |
+| `ISIDORE_TOKEN` | generated | admin bearer token for the API/UI; generated at startup when unset (see [Authentication](#authentication)) |
+| `ISIDORE_SANDBOX_BIN` | `/usr/local/bin/isidore-sandbox` | Landlock launcher binary used to sandbox each worker |
+| `ISIDORE_UNSAFE_NO_SANDBOX` | `0` | `1` runs workers without the launcher (logged loudly; dev only) |
 | `ISIDORE_SCHEDULER_URL` | none | enables the schedule form |
-| `ISIDORE_SCHEDULER_TOKEN` | none | bearer token for the scheduler |
+| `ISIDORE_SCHEDULER_TOKEN` | none | bearer token for the scheduler; when unset, read per-request from `ISIDORE_SCHEDULER_TOKEN_FILE` |
+| `ISIDORE_SCHEDULER_TOKEN_FILE` | `/state/scheduler-shared/scheduler-token` | file holding the scheduler admin token (compose: `scheduler-auth` volume; the scheduler generates it at startup when `SCHEDULER_TOKEN` is unset) |
 | `ISIDORE_TELEGRAM_TOKEN` | none | bot token; enables the bot |
 | `ISIDORE_TELEGRAM_TOKEN_FILE` | none | file holding the token, used when `ISIDORE_TELEGRAM_TOKEN` is unset |
 | `ISIDORE_TELEGRAM_CHATS` | empty | allowed chat ids |

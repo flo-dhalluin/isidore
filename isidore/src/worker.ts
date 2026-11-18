@@ -16,6 +16,7 @@
 import { join } from "node:path";
 import {
   createAgentSession,
+  createBashToolDefinition,
   createCodemodeExtension,
   createMcpExtension,
   createToolSearchExtension,
@@ -27,12 +28,15 @@ import {
   SettingsManager,
   type AgentSessionEvent,
 } from "@earendil-works/pi-coding-agent";
+import { scrubEnv } from "./env-scrub.ts";
 
 interface WorkerRequest {
   prompt: string;
   model?: string | null;
   sessionId?: string | null;
   thinkingLevel?: string | null;
+  /** OpenRouter key from the runner's stdin request (never in the exec env). */
+  apiKey?: string | null;
 }
 
 /** Mirror the CLI's JSON-mode transformation: strip cumulative snapshots. */
@@ -81,10 +85,31 @@ async function main(): Promise<number> {
   const agentDir = getAgentDir();
   const sessionDir = process.env.PI_CODING_AGENT_SESSION_DIR;
 
+  // No on-disk credential store: tasks must never read (or create) an
+  // auth.json. The API key arrives via the stdin request and is moved into
+  // the runtime's in-memory credential overlay below.
   const modelRuntime = await ModelRuntime.create({
-    authPath: join(agentDir, "auth.json"),
+    credentials: {
+      read: async () => undefined,
+      list: async () => [],
+      modify: async (_providerId, fn) => fn(undefined),
+      delete: async () => {},
+    },
     modelsPath: join(agentDir, "models.json"),
   });
+
+  // The key travels in the stdin request, NOT the exec environment, so it is
+  // absent from this process's /proc/self/environ (which reflects exec-time
+  // env and is readable by in-worker tools). The env fallback is for direct /
+  // dev invocation only. Capture the key into the ModelRuntime, then remove
+  // any env copy BEFORE any tool or extension runs. Bash children are scrubbed
+  // again via spawnHook (defense in depth); ISIDORE_TASK_TOKEN/ORIGIN stay in
+  // this process's env because Pi expands them into the scheduler MCP headers.
+  const openrouterKey = request.apiKey ?? process.env.OPENROUTER_API_KEY;
+  if (openrouterKey) {
+    await modelRuntime.setRuntimeApiKey("openrouter", openrouterKey);
+  }
+  delete process.env.OPENROUTER_API_KEY;
 
   let model: ReturnType<typeof resolveCliModel>["model"];
   let thinkingLevel: ReturnType<typeof resolveCliModel>["thinkingLevel"];
@@ -100,10 +125,23 @@ async function main(): Promise<number> {
 
   // The CLI loads codemode, tool_search, and MCP as built-in extensions; the
   // SDK does not. Add them so MCP servers (browser + scheduler) still work.
+  // The inline bash override re-registers the built-in bash tool with a
+  // spawnHook that scrubs secrets from every command's environment.
   const resourceLoader = new DefaultResourceLoader({
     cwd,
     agentDir,
-    extensionFactories: [createCodemodeExtension(), createToolSearchExtension(), createMcpExtension()],
+    extensionFactories: [
+      createCodemodeExtension(),
+      createToolSearchExtension(),
+      createMcpExtension(),
+      (pi) => {
+        pi.registerTool(
+          createBashToolDefinition(cwd, {
+            spawnHook: (ctx) => ({ ...ctx, env: scrubEnv(ctx.env) }),
+          }),
+        );
+      },
+    ],
   });
   await resourceLoader.reload();
 
