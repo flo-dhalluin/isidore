@@ -1,0 +1,202 @@
+{% extends "base.html" %}
+{% block title %}isidore · tools{% endblock %}
+{% block style %}
+  body { margin: 0; padding: 2rem 1rem 4rem; background: var(--bg); color: var(--fg);
+         font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 1.1rem; letter-spacing: .18em; text-transform: uppercase; margin: 0 0 .25rem; }
+  .sub { color: var(--muted); margin: 0 0 1.5rem; font-size: .85rem; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .filters { display: flex; gap: .6rem; flex-wrap: wrap; margin-bottom: 1.2rem; align-items: center; }
+  select, input { background: transparent; color: inherit; border: 1px solid var(--line);
+                  padding: .4rem .5rem; font: inherit; }
+  button { background: var(--accent); color: #fff; border: 0; padding: .45rem .8rem; font: inherit;
+           cursor: pointer; flex: 0 0 auto; }
+  button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line); }
+  button.danger { background: transparent; color: #c53030; border: 1px solid var(--line); }
+  button:disabled { opacity: .5; cursor: default; }
+  .tools { display: grid; gap: .6rem; }
+  .tool { border: 1px solid var(--line); padding: .7rem .8rem; }
+  .tool.pending { border-left: 3px solid var(--accent); }
+  .tool header { display: flex; gap: .6rem; align-items: baseline; flex-wrap: wrap; }
+  .name { font-weight: 600; }
+  .id { color: var(--muted); font-size: .8rem; }
+  .badge { color: var(--muted); font-size: .75rem; border: 1px solid var(--line); border-radius: 999px;
+           padding: .05rem .45rem; }
+  .status { font-size: .75rem; text-transform: uppercase; letter-spacing: .08em; }
+  .status.active { color: #2f855a; }
+  .status.disabled { color: var(--muted); }
+  .status.pending_approval { color: var(--accent); }
+  .desc { margin: .35rem 0 0; white-space: pre-wrap; word-break: break-word; }
+  .meta { color: var(--muted); font-size: .8rem; margin: .35rem 0 0; }
+  .reason { margin: .45rem 0 0; padding: .5rem .7rem; background: rgba(127,127,127,.08);
+            border-left: 3px solid var(--accent); font-size: .85rem; white-space: pre-wrap;
+            word-break: break-word; }
+  .actions { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .6rem; align-items: center; }
+  .actions select { padding: .35rem .4rem; font-size: .82rem; }
+  .empty { color: var(--muted); }
+  .err { color: #c53030; }
+{% endblock %}
+{% block body %}
+<div class="wrap">
+  <h1>isidore &middot; tools</h1>
+  <p class="sub"><a id="back" href="/">&larr; tasks</a> &middot; tool registry &middot; <span id="count">0</span> tools
+     &middot; approving is the only way a tool becomes global</p>
+
+  <div class="filters">
+    <label>scope
+      <select id="scope">
+        <option value="">all</option>
+        <option value="global">global</option>
+        <option value="conversation">conversation</option>
+        <option value="task">task</option>
+      </select>
+    </label>
+    <label>status
+      <select id="status">
+        <option value="">all</option>
+        <option value="pending_approval">pending_approval</option>
+        <option value="active">active</option>
+        <option value="disabled">disabled</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="tools" id="tools"><p class="empty">Loading…</p></div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const TOKEN = new URLSearchParams(location.search).get("token") || "";
+if (TOKEN) { $("back").href = "/?token=" + encodeURIComponent(TOKEN); }
+
+async function api(path, opts) {
+  const headers = {"Content-Type": "application/json"};
+  if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
+  const res = await fetch(path, Object.assign({headers}, opts));
+  if (!res.ok) throw new Error((await res.text()) || res.statusText);
+  return res.status === 204 ? null : res.json();
+}
+
+function fmtTime(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return isNaN(d) ? esc(iso) : esc(d.toLocaleString());
+}
+
+// Remember rollback selections and re-render only on change, so the 3s
+// refresh does not disturb a selection or an open confirm dialog.
+const rollbackChoice = new Map();
+let lastSig = null;
+
+function provenance(m) {
+  const p = (m && m.provenance) || {};
+  const who = p.origin === "builtin" ? "builtin" : esc(p.origin || "?");
+  const root = p.root_id ? `root ${esc(p.root_id)}` : "no owner";
+  const task = p.task_id ? ` · task ${esc(p.task_id)}` : "";
+  const sha = p.sha256 ? ` · sha256 ${esc(String(p.sha256).slice(0, 12))}…` : "";
+  return `${who} · ${root}${task} · ${fmtTime(p.created_at)}${sha}`;
+}
+
+function toolCard(entry) {
+  const index = entry.index;
+  const m = entry.manifest;
+  const id = index.id;
+  const versions = index.versions || [];
+  const chosen = rollbackChoice.has(id) ? rollbackChoice.get(id) : index.current_version;
+  const buttons = [];
+  if (index.status === "pending_approval") {
+    buttons.push(`<button data-act="approve" data-id="${esc(id)}" data-name="${esc(index.name)}" data-version="${esc(index.current_version)}">approve</button>`);
+    buttons.push(`<button class="ghost" data-act="reject" data-id="${esc(id)}">reject</button>`);
+  }
+  if (index.status === "active") buttons.push(`<button class="ghost" data-act="disable" data-id="${esc(id)}">disable</button>`);
+  if (index.status === "disabled") buttons.push(`<button class="ghost" data-act="enable" data-id="${esc(id)}">enable</button>`);
+  buttons.push(`<button class="danger" data-act="delete" data-id="${esc(id)}">delete</button>`);
+  const rollback = versions.length ? `
+    <select data-version="${esc(id)}" title="rollback target version">
+      ${versions.map((v) => `<option value="${v}"${v === chosen ? " selected" : ""}>v${v}${v === index.current_version ? " (current)" : ""}</option>`).join("")}
+    </select>
+    <button class="ghost" data-act="rollback" data-id="${esc(id)}">rollback</button>` : "";
+  return `
+  <article class="tool ${index.status === "pending_approval" ? "pending" : ""}">
+    <header>
+      <span class="name">${esc(index.name)}</span>
+      <span class="id">${esc(id)}</span>
+      <span class="badge">${esc(m ? m.kind : "?")}</span>
+      <span class="badge">${esc(index.scope)}</span>
+      <span class="status ${esc(index.status)}">${esc(index.status)}</span>
+      <span class="id">v${esc(index.current_version)} of ${esc(versions.join(", "))}</span>
+    </header>
+    ${m && m.description ? `<p class="desc">${esc(m.description)}</p>` : ""}
+    ${index.status === "pending_approval" ? `<p class="reason">promotion reason: ${esc(index.promotion_reason || "(none given)")}</p>` : ""}
+    <p class="meta">${provenance(m)}</p>
+    <div class="actions">${buttons.join("")}${rollback}</div>
+  </article>`;
+}
+
+function render(tools) {
+  $("count").textContent = tools.length;
+  if (!tools.length) { $("tools").innerHTML = '<p class="empty">No tools match.</p>'; return; }
+  $("tools").innerHTML = tools.map(toolCard).join("");
+  document.querySelectorAll("select[data-version]").forEach((sel) => {
+    sel.onchange = () => rollbackChoice.set(sel.dataset.version, Number(sel.value));
+  });
+  document.querySelectorAll("button[data-act]").forEach((b) => {
+    b.onclick = async () => {
+      const id = b.dataset.id;
+      const act = b.dataset.act;
+      if (act === "approve") {
+        // Show name + version and pin the review: if the creator updated the
+        // tool since this page rendered, the API refuses with 409.
+        const version = Number(b.dataset.version);
+        if (!confirm(`Approve "${b.dataset.name}" v${version}? It becomes ACTIVE and GLOBAL for every new task.`)) return;
+        b.disabled = true;
+        try {
+          await api("/api/tools/" + encodeURIComponent(id) + "/approve", {method: "POST", body: JSON.stringify({expected_version: version})});
+        } catch (e) { alert(e.message); }
+        refresh(true);
+        return;
+      }
+      if (act === "delete" && !confirm("Delete this tool, all its versions and every cached copy?")) return;
+      b.disabled = true;
+      try {
+        if (act === "delete") {
+          await api("/api/tools/" + encodeURIComponent(id), {method: "DELETE"});
+          rollbackChoice.delete(id);
+        } else if (act === "rollback") {
+          const sel = document.querySelector(`select[data-version="${CSS.escape(id)}"]`);
+          const version = Number(sel ? sel.value : rollbackChoice.get(id));
+          if (!Number.isInteger(version) || version <= 0) { alert("Pick a valid rollback version first."); b.disabled = false; return; }
+          await api("/api/tools/" + encodeURIComponent(id) + "/rollback",
+            {method: "POST", body: JSON.stringify({version})});
+        } else {
+          await api("/api/tools/" + encodeURIComponent(id) + "/" + act, {method: "POST"});
+        }
+      } catch (e) { alert(e.message); }
+      refresh(true);
+    };
+  });
+}
+
+async function refresh(force) {
+  const params = new URLSearchParams();
+  if ($("scope").value) params.set("scope", $("scope").value);
+  if ($("status").value) params.set("status", $("status").value);
+  const qs = params.toString();
+  try {
+    const tools = (await api("/api/tools" + (qs ? "?" + qs : ""))).tools || [];
+    const sig = JSON.stringify(tools);
+    if (!force && sig === lastSig) return;
+    lastSig = sig;
+    render(tools);
+  } catch (e) { $("tools").innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+}
+
+$("scope").onchange = () => refresh(true);
+$("status").onchange = () => refresh(true);
+refresh(true);
+setInterval(() => refresh(false), 3000);
+</script>
+{% endblock %}

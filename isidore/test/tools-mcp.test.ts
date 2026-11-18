@@ -258,6 +258,7 @@ test("extension kind is rejected for ALL callers (human-authored via the admin A
       });
       assert.equal(ext.isError, true);
       assert.match(ext.content[0].text!, /admin API/);
+      assert.match(ext.content[0].text!, /POST \/api\/tools/);
     }
     // The extension-only "entry" argument is no longer accepted at all.
     const entryArg = await call(app, token, "tool_create", createArgs("withentry", { entry: "ext.ts" }));

@@ -1,6 +1,8 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Runner } from "./runner.ts";
 import { isDone, rootId, type Task, type TaskStore } from "./store.ts";
+import { approvePromotion } from "./tools-api.ts";
+import type { ToolRegistry } from "./tools.ts";
 
 const TASK_ID = /\bt_[0-9a-f]{12}\b/;
 const MAX_MESSAGE = 3_800; // Telegram's hard limit is 4096; leave room for a header.
@@ -19,6 +21,8 @@ export interface TelegramOptions {
   webhookUrl?: string | null;
   /** Value Telegram echoes in `X-Telegram-Bot-Api-Secret-Token`. */
   webhookSecret?: string | null;
+  /** Tool registry for /tools and /approve (Phase 4); unset disables them. */
+  registry?: ToolRegistry;
 }
 
 /** Derive a webhook secret from the bot token: [A-Za-z0-9_-], stable across restarts. */
@@ -36,6 +40,7 @@ export class TelegramBot {
   private readonly runner: Runner;
   private readonly store: TaskStore;
   private readonly allowedChats: Set<string>;
+  private readonly registry: ToolRegistry | null;
   private readonly apiBase: string;
   private readonly pollTimeout: number;
   readonly webhookUrl: string | null;
@@ -52,6 +57,7 @@ export class TelegramBot {
     this.runner = runner;
     this.store = store;
     this.allowedChats = allowedChats;
+    this.registry = options.registry ?? null;
     this.apiBase = (options.apiBase ?? "https://api.telegram.org").replace(/\/+$/, "");
     this.pollTimeout = options.pollTimeout ?? 30;
     this.webhookUrl = options.webhookUrl || null;
@@ -192,6 +198,8 @@ export class TelegramBot {
     } else if (command === "/list") await this.list(chatId);
     else if (command === "/status") await this.status(chatId, rest);
     else if (command === "/cancel") await this.cancel(chatId, rest);
+    else if (command === "/tools") await this.tools(chatId);
+    else if (command === "/approve") await this.approve(chatId, rest);
     else if (command.startsWith("/")) await this.send(chatId, `Unknown command ${command}. Try /help.`);
     else await this.create(chatId, text);
   }
@@ -250,6 +258,57 @@ export class TelegramBot {
     else await this.send(chatId, `${taskId} is unknown or already finished.`);
   }
 
+  /** /tools: pending promotions + active global tools, concise (allowed chats only). */
+  private async tools(chatId: string): Promise<void> {
+    if (!this.registry) {
+      await this.send(chatId, "Tool registry is not configured.");
+      return;
+    }
+    const line = (id: string, name: string, extra: string): string => {
+      const manifest = this.registry!.get(id);
+      return `${id}  ${name}  ${manifest?.kind ?? "?"} v${manifest?.version ?? "?"}${extra}`;
+    };
+    const pending = this.registry.list({ status: "pending_approval" });
+    const globals = this.registry.list({ scope: "global", status: "active" });
+    const parts: string[] = [];
+    parts.push(
+      pending.length
+        ? `Pending approval:\n${pending.map((index) => line(index.id, index.name, `\n  reason: ${index.promotion_reason ?? "(none)"}`)).join("\n")}`
+        : "No tools pending approval.",
+    );
+    parts.push(
+      globals.length
+        ? `Active global tools:\n${globals.map((index) => line(index.id, index.name, "")).join("\n")}`
+        : "No active global tools.",
+    );
+    parts.push("Approve with /approve <id> (or the /tools web page).");
+    await this.send(chatId, parts.join("\n\n"));
+  }
+
+  /** /approve <id>: the same human-gated promotion path as POST /api/tools/:id/approve. */
+  private async approve(chatId: string, id: string): Promise<void> {
+    if (!this.registry) {
+      await this.send(chatId, "Tool registry is not configured.");
+      return;
+    }
+    if (!id) {
+      await this.send(chatId, "Usage: /approve <tool-id>");
+      return;
+    }
+    // Echo name + version BEFORE applying so the human sees exactly what is
+    // being approved (the web UI sends expected_version for the same reason).
+    const pending = this.registry.getIndex(id);
+    if (pending) {
+      await this.send(chatId, `Approving ${pending.name} v${pending.current_version} (${id})…`);
+    }
+    const outcome = approvePromotion(this.registry, id);
+    if (!outcome.ok) {
+      await this.send(chatId, `Not approved: ${outcome.error}`);
+      return;
+    }
+    await this.send(chatId, `Approved ${id} (${outcome.index.name} v${outcome.index.current_version}): now active and global for new tasks.`);
+  }
+
   /** Called by the runner whenever a task changes state. */
   async notify(task: Task): Promise<void> {
     if (!task.origin.startsWith("telegram:")) return;
@@ -280,6 +339,8 @@ export class TelegramBot {
       "/list           recent tasks",
       "/status <id>    task details and output",
       "/cancel <id>    cancel a task",
+      "/tools          pending tool promotions + active global tools",
+      "/approve <id>   approve a pending tool promotion (global scope)",
       "/help           this message",
     ].join("\n");
   }

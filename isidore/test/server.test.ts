@@ -67,10 +67,20 @@ test("serves the UI, API and runs a task end to end", async () => {
     assert.equal(index.statusCode, 200);
     assert.match(index.body, /id="run"/);
     assert.match(index.body, /isidore/);
+    // The index links to the tool registry page (token propagated client-side).
+    assert.match(index.body, /id="tools-link" href="\/tools"/);
 
     const taskPage = await app.inject({ method: "GET", url: "/tasks/t_abc", headers: adminAuth });
     assert.equal(taskPage.statusCode, 200);
     assert.match(taskPage.body, /id="ask"/);
+
+    const toolsPage = await app.inject({ method: "GET", url: "/tools", headers: adminAuth });
+    assert.equal(toolsPage.statusCode, 200);
+    assert.match(toolsPage.body, /id="tools"/);
+    assert.match(toolsPage.body, /tool registry/);
+    assert.match(toolsPage.body, /\/api\/tools/);
+    // Like the other UI pages, no server-side data (token) is injected.
+    assert.ok(!toolsPage.body.includes(ADMIN));
 
     const health = await app.inject({ method: "GET", url: "/healthz" });
     assert.equal(health.statusCode, 200);
@@ -147,6 +157,8 @@ test("no token => 401 on every authenticated surface", async () => {
       ["GET", "/api/auth/whoami"],
       ["GET", "/"],
       ["GET", "/tasks/t_abc"],
+      ["GET", "/tools"],
+      ["GET", "/api/tools"],
     ] as const) {
       const response = await app.inject({ method, url, payload: method === "POST" ? { prompt: "x" } : undefined });
       assert.equal(response.statusCode, 401, `${method} ${url}`);
@@ -175,7 +187,10 @@ test("admin token via Bearer and ?token=; ?token= is admin-only", async () => {
     assert.equal((await app.inject({ method: "GET", url: `/api/info?token=${taskToken}` })).statusCode, 401);
     assert.equal((await app.inject({ method: "GET", url: "/", headers: bearer(taskToken) })).statusCode, 401);
     assert.equal((await app.inject({ method: "GET", url: `/tasks/${task.id}`, headers: bearer(taskToken) })).statusCode, 401);
+    assert.equal((await app.inject({ method: "GET", url: "/tools", headers: bearer(taskToken) })).statusCode, 401);
+    assert.equal((await app.inject({ method: "GET", url: `/tools?token=${taskToken}` })).statusCode, 401);
     assert.equal((await app.inject({ method: "GET", url: `/?token=${ADMIN}` })).statusCode, 200);
+    assert.equal((await app.inject({ method: "GET", url: `/tools?token=${ADMIN}` })).statusCode, 200);
   } finally {
     await app.close();
     rmSync(dir, { recursive: true, force: true });

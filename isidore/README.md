@@ -28,11 +28,12 @@ Each task is a separate process with:
 A conversation is a chain of tasks that share the root task's workspace and
 Pi session, so a follow-up keeps the earlier files and history.
 
-The Pi config directory (`/state/pi`) is shared so every task sees the same
-model catalog, `pi-web-access`, and MCP servers (browser + scheduler), but
-sessions are redirected into each workspace. If you need stronger isolation,
-run isidore with a different `ISIDORE_STATE` per tenant or put each task in
-its own container.
+The Pi config directory (`/state/pi`) is shared **read-only** so every task
+sees the same model catalog and `pi-web-access`; sessions are redirected into
+each workspace. MCP servers no longer come from a shared `mcp.json`: each
+worker is composed from the [tool registry](#tool-registry) at spawn. If you
+need stronger isolation, run isidore with a different `ISIDORE_STATE` per
+tenant or put each task in its own container.
 
 ## Web UI
 
@@ -108,6 +109,101 @@ are accepted:
 
 The compose port is loopback-only; use a reverse proxy for remote access.
 
+## Tool registry
+
+Each spawn is composed from a service-owned registry (`src/tools.ts`):
+builtin manifests (browser, scheduler, the `tools` authoring MCP, plus
+informational extension entries), the conversation's own active tools, any
+human-approved active globals, and — for lineage children (`conversation_id`
+on `POST /api/tasks`) — the parent conversation's tools pinned to the version
+current at spawn. Workers never touch the registry itself.
+
+Storage (service-only; the sandbox denies `/state/tools` to workers):
+
+```text
+/state/tools/<id>/index.json               mutable: scope, status, ownership, current_version, versions
+/state/tools/<id>/<version>/               immutable: manifest.json + files/<name>
+/state/tool-cache/<root>/<id>/<version>/   per-conversation copies of command sources, mounted read-only
+```
+
+### Authoring
+
+Agents author tools through the `tools` MCP (`POST /mcp/tools`, Bearer task
+token): `tool_create`, `tool_list`, `tool_get`, `tool_update`, `tool_disable`,
+`tool_remove`, `tool_request_promotion`. Kinds: `mcp` (http(s) endpoint,
+`${VAR}` header templates expanded from the worker env) and `command` (argv
+with `{{param}}` whole-token templates + source files, run under the worker's
+Landlock ruleset with a scrubbed env, no shell). Created/updated tools
+register in the same turn. `extension` tools are human-authored only — via
+`POST /api/tools` (admin), never the agent MCP. Humans can also author
+`command`/`mcp` globals there: origin `human`, scope `global`, active
+immediately (no approval needed — a human is the author).
+
+Visibility is per conversation: a task sees and mutates only its own tools
+(plus active globals, read-only). New tools default to `conversation` scope;
+`scope: "global"` from an agent always lands in `pending_approval`.
+
+### Promotion (human-gated)
+
+`tool_request_promotion` records a reason and sets `pending_approval`. A
+human then approves from the tool registry page, the admin API, or Telegram
+(`/tools` lists pending promotions + active globals, `/approve <id>`
+approves; allowed chats only). Approval is the **only** path to
+active+global for agent-authored tools: it re-checks name collisions
+(including MCP `-`/`_` namespace normalization) against active globals and
+builtins, then activates the tool, makes it global and clears creator
+ownership in ONE atomic index write. The web confirm shows the tool's name +
+version and sends `expected_version`; if the creator updated the tool between
+review and approval, approve returns 409 (Telegram echoes name + version
+before applying). Reject sets
+`disabled` but keeps scope + ownership, so the creator can revise and
+re-promote. `disable` hides a tool from new spawns (running workers keep
+their copy); `enable` restores a disabled tool but refuses never-approved
+globals, so it cannot bypass approval. `rollback` points `current_version`
+at any recorded immutable version; old versions stay readable forever.
+
+### Admin surface
+
+`/tools?token=<TOKEN>` (linked from the main page) lists every tool with
+scope, status, version, provenance and the pending reason, with
+approve/reject/disable/enable/rollback/delete actions. The API behind it is
+**admin-only** — task tokens get 401 on every route:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/tools` | human authoring: `{name, kind, description, …, scope?}` → 201; the only place `extension` tools can be created (`files` + `entry`); command/mcp globals are active immediately |
+| `GET` | `/api/tools?scope=&status=` | indexes + current manifests + provenance |
+| `GET` | `/api/tools/{id}?version=` | one tool; an explicit `?version=` is returned verbatim (immutable), the index carries live state |
+| `POST` | `/api/tools/{id}/approve` | pending → active + global (collision re-check; optional `{expected_version}` → 409 if the tool changed since review) |
+| `POST` | `/api/tools/{id}/reject` | pending → disabled, ownership kept |
+| `POST` | `/api/tools/{id}/disable` | hide from new spawns |
+| `POST` | `/api/tools/{id}/enable` | disabled → active (never bypasses approval) |
+| `POST` | `/api/tools/{id}/rollback` | `{version}` → any recorded version |
+| `DELETE` | `/api/tools/{id}` | remove records + every cache copy across roots |
+
+Deleting a conversation (`DELETE /api/tasks/{id}`) also deletes its scoped
+tools and their cache copies.
+
+### Limits
+
+| Limit | Value |
+|---|---|
+| tools per conversation (incl. pending globals) | 32 |
+| manifest size | 16 KB |
+| command source per version (≤16 files) | 64 KB |
+| command timeout | 120 s max, 30 s default |
+| command stdout/stderr | truncated at `MAX_EVENT_TEXT` (4000 chars) each |
+
+### Residual risks
+
+The registry does not change the isolation model: all tasks share one uid
+and Landlock ABI 4 does not scope signals, so a task can `kill` another
+worker; CPU/memory/pids are capped per container, not per task, so a task
+can starve its siblings; outbound network is open, so a task can exfiltrate
+anything it can read (its own workspace and tool cache); and the
+`/proc/self` allow-list rule covers the worker pid only, so command-tool
+children cannot read their own `/proc/self`.
+
 ## Telegram
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) and copy the token.
@@ -127,12 +223,13 @@ authenticated by Telegram's `X-Telegram-Bot-Api-Secret-Token` header, not by
 `ISIDORE_TOKEN`; the secret defaults to an HMAC of the bot token
 (override with `ISIDORE_TELEGRAM_WEBHOOK_SECRET[_FILE]`). An empty allow-list denies
 everyone. Commands: `/new <prompt>` (plain text also works), `/list`,
-`/status <id>`, `/cancel <id>`, `/help`. The originating chat is notified once
+`/status <id>`, `/cancel <id>`, `/tools`, `/approve <id>`, `/help`. The
+originating chat is notified once
 when a task finishes (only if it is an allowed chat). Replying to a bot message
 that names a task queues a follow-up turn in that task's thread.
 
 Each worker gets `ISIDORE_TASK_ORIGIN` (e.g. `telegram:<chat>`), which the
-entrypoint's `mcp.json` sends to the scheduler as `X-Isidore-Origin`; a
+builtin scheduler tool sends to the scheduler as `X-Isidore-Origin`; a
 schedule created from a Telegram task fires its tasks with that origin, so
 their results go back to the chat.
 
