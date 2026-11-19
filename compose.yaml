@@ -44,6 +44,7 @@ services:
       args:
         PI_VERSION: ${PI_VERSION:-latest}
         PI_WEB_PACKAGE: ${PI_WEB_PACKAGE:-pi-web-access}
+        ISIDORE_SOURCE: ${ISIDORE_SOURCE:-unknown}
     image: pi-sandbox-isidore:${PI_VERSION:-latest}
     hostname: isidore
     user: ${PI_UID:-1000}:${PI_GID:-1000}

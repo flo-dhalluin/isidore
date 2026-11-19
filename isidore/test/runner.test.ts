@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -268,6 +268,7 @@ test("prepareAgentDir copies config, symlinks the rest, denies secrets; idempote
     mkdirSync(join(shared, "web-search-cache"), { recursive: true });
     mkdirSync(join(shared, "tmp"), { recursive: true });
     writeFileSync(join(shared, "models.json"), '{"models":1}\n');
+    writeFileSync(join(shared, "models-store.json"), '{"openrouter":{}}\n');
     writeFileSync(join(shared, "mcp.json"), '{"servers":1}\n');
     writeFileSync(join(shared, "settings.json"), "{}\n");
     writeFileSync(join(shared, "auth.json"), '{"secret":1}\n');
@@ -279,7 +280,7 @@ test("prepareAgentDir copies config, symlinks the rest, denies secrets; idempote
     const targets = prepareAgentDir(ws, shared);
     const pi = join(ws, ".pi");
     // Small configs are per-task writable copies.
-    for (const name of ["models.json", "mcp.json", "settings.json"]) {
+    for (const name of ["models.json", "models-store.json", "mcp.json", "settings.json"]) {
       assert.ok(lstatSync(join(pi, name)).isFile(), `${name} must be a copy`);
       assert.equal(readFileSync(join(pi, name), "utf8"), readFileSync(join(shared, name), "utf8"));
     }
@@ -300,6 +301,17 @@ test("prepareAgentDir copies config, symlinks the rest, denies secrets; idempote
     assert.equal(readFileSync(join(pi, "mcp.json"), "utf8"), '{"servers":2}\n');
     assert.ok(again.includes(join(shared, "npm")));
     assert.ok(lstatSync(join(pi, "npm")).isSymbolicLink());
+
+    // A workspace created before models-store.json was copied may still have a
+    // symlink there; a followup must replace the link with a real copy. Pi
+    // locks the resolved file, so writing through the link would land in the
+    // read-only shared dir.
+    rmSync(join(pi, "models-store.json"));
+    symlinkSync(join(shared, "models-store.json"), join(pi, "models-store.json"));
+    prepareAgentDir(ws, shared);
+    assert.ok(!lstatSync(join(pi, "models-store.json")).isSymbolicLink());
+    writeFileSync(join(pi, "models-store.json"), '{"openrouter":{"local":true}}\n');
+    assert.equal(readFileSync(join(shared, "models-store.json"), "utf8"), '{"openrouter":{}}\n');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

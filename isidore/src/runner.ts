@@ -103,8 +103,16 @@ export function buildSandboxArgs(workspace: string, agentDirTargets: string[]): 
 
 /** Shared agent-dir entries a task must never see (secrets, other sessions, state). */
 const AGENT_DIR_DENYLIST = new Set(["auth.json", "sessions", "web-search-cache", ".seed", "tmp"]);
-/** Small config files copied per task (writable); everything else is symlinked read-only. */
-const AGENT_DIR_COPIES = new Set(["models.json", "mcp.json", "settings.json"]);
+/**
+ * Small config files copied per task (writable); everything else is symlinked
+ * read-only.
+ *
+ * models-store.json must be a copy, not a symlink: Pi >= 1.5.2 locks the
+ * resolved store file (proper-lockfile no longer gets `realpath: false`), so a
+ * symlink makes the runtime create `<shared>/models-store.json.lock` next to
+ * the read-only target. Landlock denies that, which aborts setRuntimeApiKey.
+ */
+const AGENT_DIR_COPIES = new Set(["models.json", "models-store.json", "mcp.json", "settings.json"]);
 
 /**
  * Build the per-task agent dir `<workspace>/.pi` from the shared Pi dir.
@@ -130,7 +138,12 @@ export function prepareAgentDir(workspace: string, sharedAgentDir: string): stri
     const source = join(sharedAgentDir, name);
     const dest = join(dir, name);
     if (AGENT_DIR_COPIES.has(name)) {
-      if (entry.isFile()) copyFileSync(source, dest);
+      if (entry.isFile()) {
+        // Replace any previous entry, including a symlink left by an older
+        // workspace, so a copy never writes through a link into the shared dir.
+        rmSync(dest, { recursive: true, force: true });
+        copyFileSync(source, dest);
+      }
       continue;
     }
     // Symlink everything else (npm/, extensions/, themes/, ...). Refresh on

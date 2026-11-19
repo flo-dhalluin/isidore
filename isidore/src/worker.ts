@@ -79,6 +79,25 @@ async function readRequest(): Promise<WorkerRequest> {
   return JSON.parse(text) as WorkerRequest;
 }
 
+/** Error text plus Pi's `cause` chain (synchronization failures hide the real
+ * error there, e.g. an EACCES from the Landlock sandbox). stderr is persisted
+ * as the task error by the runner. */
+function describeError(error: unknown): string {
+  const text = error instanceof Error ? (error.stack ?? error.message) : String(error);
+  const causes: string[] = [];
+  let current: unknown = error instanceof Error ? error.cause : undefined;
+  for (let depth = 0; current !== undefined && current !== null && depth < 5; depth++) {
+    if (current instanceof Error) {
+      causes.push(current.message || current.name);
+      current = current.cause;
+    } else {
+      causes.push(String(current));
+      break;
+    }
+  }
+  return causes.length > 0 ? `${text}\nCaused by: ${causes.join(": ")}` : text;
+}
+
 async function main(): Promise<number> {
   const request = await readRequest();
   const cwd = process.cwd();
@@ -189,7 +208,7 @@ async function main(): Promise<number> {
       exitCode = 1;
     }
   } catch (error) {
-    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.stderr.write(`${describeError(error)}\n`);
     exitCode = 1;
   } finally {
     unsubscribe?.();
@@ -209,11 +228,11 @@ console.log = (...args: unknown[]) => {
 };
 
 process.on("uncaughtException", (error) => {
-  process.stderr.write(`${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`);
+  process.stderr.write(`${describeError(error)}\n`);
   process.exit(1);
 });
 process.on("unhandledRejection", (reason) => {
-  process.stderr.write(`${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}\n`);
+  process.stderr.write(`${describeError(reason)}\n`);
   process.exit(1);
 });
 
@@ -226,7 +245,7 @@ main().then(
     setTimeout(() => process.exit(code), 1000).unref();
   },
   async (error) => {
-    process.stderr.write(`${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`);
+    process.stderr.write(`${describeError(error)}\n`);
     await flush();
     process.exitCode = 1;
     setTimeout(() => process.exit(1), 1000).unref();
