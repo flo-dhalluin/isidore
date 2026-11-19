@@ -4,7 +4,7 @@
 
 # Build the Landlock launcher (isidore/sandbox) in a separate stage so the
 # final image carries only the small static-ish binary, no toolchain.
-FROM debian:bookworm-slim AS sandbox-build
+FROM debian:trixie-slim AS sandbox-build
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
  && apt-get install -y --no-install-recommends gcc make libc6-dev linux-libc-dev \
@@ -12,7 +12,7 @@ RUN apt-get update \
 COPY sandbox/ /src/sandbox/
 RUN make -C /src/sandbox
 
-FROM node:24-bookworm-slim
+FROM node:24-trixie-slim
 
 ARG PI_VERSION
 ARG PI_WEB_PACKAGE=pi-web-access
@@ -47,7 +47,14 @@ RUN npm install --no-audit --no-fund \
  && npm install --no-audit --no-fund "@earendil-works/pi-coding-agent@${PI_VERSION}"
 COPY src ./src
 COPY templates ./templates
-RUN npm run build && npm prune --omit=dev
+# Build stamp from launch.sh. Referencing it in the RUN below means a changed
+# source tree always re-runs the build (even if COPY cache is stale), and the
+# label lets the deploy verify the image it is about to run.
+ARG ISIDORE_SOURCE=unknown
+RUN echo "building isidore source ${ISIDORE_SOURCE}" \
+ && npm run build \
+ && npm prune --omit=dev
+LABEL io.isidore.source="${ISIDORE_SOURCE}"
 
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/isidore-entry
 COPY --from=sandbox-build /src/sandbox/isidore-sandbox /usr/local/bin/isidore-sandbox
