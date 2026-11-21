@@ -1,6 +1,7 @@
 #!/bin/sh
 # isidore entrypoint: unlock the credential, seed the Pi config used by every
-# spawned task, wire the MCP servers, then start the web service.
+# spawned task, then start the web service. MCP servers (browser, scheduler)
+# are registered per worker from the tool registry — no shared mcp.json.
 set -eu
 
 export HOME="${HOME:-/state/home}"
@@ -22,34 +23,6 @@ if [ "$seed_tag" != "$(cat "$PI_CODING_AGENT_DIR/.seed" 2>/dev/null || true)" ];
 	cp -a --no-preserve=ownership /opt/pi-config/. "$PI_CODING_AGENT_DIR"/
 	printf 'isidore: refreshing model catalog...\n' >&2
 	pi update --models >/dev/null 2>&1 || true
-fi
-
-# MCP servers available to every spawned task. Pi expands ${VAR} in header
-# values from the worker's environment; the runner sets ISIDORE_TASK_ORIGIN
-# per task so the scheduler knows where a schedule came from. Entries are removed again when
-# the corresponding URL is unset, so the state dir stays consistent.
-mcp_file="$PI_CODING_AGENT_DIR/mcp.json"
-[ -s "$mcp_file" ] || printf '{}\n' >"$mcp_file"
-
-if [ -n "${PI_SANDBOX_BROWSER_URL:-}" ]; then
-	jq --arg url "$PI_SANDBOX_BROWSER_URL" '.mcpServers.browser = {
-		url: $url, exposure: "direct", timeout: 120,
-		description: "Headless Firefox: open pages, read and interact with them, fill forms, take screenshots"
-	}' "$mcp_file" >"$mcp_file.tmp" && mv "$mcp_file.tmp" "$mcp_file"
-else
-	jq 'del(.mcpServers.browser)' "$mcp_file" >"$mcp_file.tmp" && mv "$mcp_file.tmp" "$mcp_file"
-fi
-
-if [ -n "${PI_SANDBOX_SCHEDULER_URL:-}" ]; then
-	# Task-token auth only: mcp.json is worker-readable, so it must contain no
-	# admin secret. Pi expands ${VAR} from each worker's env; the runner mints
-	# ISIDORE_TASK_TOKEN per task and sets ISIDORE_TASK_ORIGIN.
-	jq --arg url "$PI_SANDBOX_SCHEDULER_URL" '.mcpServers.scheduler = {
-		url: $url, headers: {"X-Isidore-Task-Token": "${ISIDORE_TASK_TOKEN}", "X-Isidore-Origin": "${ISIDORE_TASK_ORIGIN}"}, exposure: "direct", timeout: 30,
-		description: "Schedule one-shot or recurring tasks that spawn isolated Pi agents"
-	}' "$mcp_file" >"$mcp_file.tmp" && mv "$mcp_file.tmp" "$mcp_file"
-else
-	jq 'del(.mcpServers.scheduler)' "$mcp_file" >"$mcp_file.tmp" && mv "$mcp_file.tmp" "$mcp_file"
 fi
 
 # A usable git identity for spawned tasks (they get a per-task HOME).
