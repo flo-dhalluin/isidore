@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { Runner, buildSandboxArgs, buildWorkerRequest, prepareAgentDir, summariseEvent } from "../src/runner.ts";
 import { TaskStore, createTask } from "../src/store.ts";
 import { TokenRegistry } from "../src/tokens.ts";
+import { ToolRegistry, type ResolvedTool } from "../src/tools.ts";
 
 const SANDBOX_BIN = join(import.meta.dirname, "..", "sandbox", "isidore-sandbox");
 
@@ -25,6 +26,21 @@ async function waitDone(store: TaskStore, id: string, timeout = 5000): Promise<v
   throw new Error("task did not finish");
 }
 
+/** True if pid is gone (or an unreaped zombie — dead, just not reaped by pid 1). */
+function processGone(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return true;
+  }
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
+  } catch {
+    return true;
+  }
+}
+
 test("buildWorkerRequest prefers the task model", () => {
   const task = createTask("hello", { model: "task-model" });
   const request = buildWorkerRequest(task, "default-model");
@@ -32,7 +48,33 @@ test("buildWorkerRequest prefers the task model", () => {
   assert.equal(request.model, "task-model");
   assert.equal(request.sessionId, task.id);
   assert.equal(request.apiKey, null);
+  assert.equal(request.tools, undefined);
   assert.equal(buildWorkerRequest(task, null, "sk-or-x").apiKey, "sk-or-x");
+});
+
+test("buildWorkerRequest carries the resolved tool set (additive)", () => {
+  const task = createTask("hello");
+  const tools: ResolvedTool[] = [
+    {
+      manifest: {
+        id: "tl_0123456789ab",
+        name: "echoer",
+        version: 1,
+        kind: "command",
+        description: "echo",
+        scope: "conversation",
+        status: "active",
+        input_schema: { type: "object", properties: { text: { type: "string" } } },
+        command: { argv: ["echo", "{{text}}"], files: { "run.sh": "#!/bin/sh\n" } },
+        provenance: { task_id: task.id, root_id: task.id, origin: "task", created_at: "now", sha256: "x" },
+      },
+      cachePath: "/state/tool-cache/" + task.id + "/tl_0123456789ab/1",
+    },
+  ];
+  const request = buildWorkerRequest(task, null, null, tools);
+  assert.deepEqual(request.tools, tools);
+  // Without tools the field stays absent (old workers ignore it either way).
+  assert.ok(!("tools" in buildWorkerRequest(task, null)));
 });
 
 test("summariseEvent extracts streamed text", () => {
@@ -258,6 +300,17 @@ test("buildSandboxArgs allows the workspace, ro targets and devices, never /stat
   assert.ok(!args.includes("/proc"));
 });
 
+test("buildSandboxArgs appends tool-cache paths (rx), never /state/tools", () => {
+  const args = buildSandboxArgs("/state/workspaces/t_1", [], ["/state/tool-cache/t_1"]);
+  const joined = args.join(" ");
+  assert.ok(joined.includes("--rx /state/tool-cache/t_1"));
+  // The registry itself stays service-only: never listed, even as a parent.
+  assert.ok(!joined.includes("/state/tools"));
+  assert.ok(!args.includes("/state"));
+  // Default: no extra entries.
+  assert.deepEqual(buildSandboxArgs("/state/workspaces/t_1", []), buildSandboxArgs("/state/workspaces/t_1", [], []));
+});
+
 test("prepareAgentDir copies config, symlinks the rest, denies secrets; idempotent", () => {
   const dir = mkdtempSync(join(tmpdir(), "isidore-agentdir-"));
   try {
@@ -284,6 +337,10 @@ test("prepareAgentDir copies config, symlinks the rest, denies secrets; idempote
       assert.ok(lstatSync(join(pi, name)).isFile(), `${name} must be a copy`);
       assert.equal(readFileSync(join(pi, name), "utf8"), readFileSync(join(shared, name), "utf8"));
     }
+    // mcp.json is neither copied nor linked any more (Phase 2: MCP servers
+    // are registered per worker by the registry extension).
+    assert.ok(!existsSync(join(pi, "mcp.json")), "mcp.json must not be copied or linked");
+    assert.ok(!targets.includes(join(shared, "mcp.json")));
     // Everything else is a symlink to the shared dir (Landlock gets the target).
     assert.ok(lstatSync(join(pi, "npm")).isSymbolicLink());
     assert.equal(readlinkSync(join(pi, "npm")), join(shared, "npm"));
@@ -296,9 +353,9 @@ test("prepareAgentDir copies config, symlinks the rest, denies secrets; idempote
     assert.ok(lstatSync(join(pi, "web-search-cache")).isDirectory());
 
     // Idempotent refresh (followup): copies updated, targets still returned.
-    writeFileSync(join(shared, "mcp.json"), '{"servers":2}\n');
+    writeFileSync(join(shared, "models.json"), '{"models":2}\n');
     const again = prepareAgentDir(ws, shared);
-    assert.equal(readFileSync(join(pi, "mcp.json"), "utf8"), '{"servers":2}\n');
+    assert.equal(readFileSync(join(pi, "models.json"), "utf8"), '{"models":2}\n');
     assert.ok(again.includes(join(shared, "npm")));
     assert.ok(lstatSync(join(pi, "npm")).isSymbolicLink());
 
@@ -312,6 +369,27 @@ test("prepareAgentDir copies config, symlinks the rest, denies secrets; idempote
     assert.ok(!lstatSync(join(pi, "models-store.json")).isSymbolicLink());
     writeFileSync(join(pi, "models-store.json"), '{"openrouter":{"local":true}}\n');
     assert.equal(readFileSync(join(shared, "models-store.json"), "utf8"), '{"openrouter":{}}\n');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("prepareAgentDir deletes a stale per-task mcp.json on refresh", () => {
+  const dir = mkdtempSync(join(tmpdir(), "isidore-agentdir-"));
+  try {
+    const shared = join(dir, "shared-pi");
+    const ws = join(dir, "ws");
+    mkdirSync(shared, { recursive: true });
+    writeFileSync(join(shared, "mcp.json"), '{"mcpServers":{"evil":{"url":"http://evil"}}}\n');
+    // A leftover copy from a pre-Phase-2 spawn must not survive a refresh.
+    mkdirSync(join(ws, ".pi"), { recursive: true });
+    writeFileSync(join(ws, ".pi", "mcp.json"), '{"mcpServers":{"stale":{"url":"http://stale"}}}\n');
+    const targets = prepareAgentDir(ws, shared);
+    assert.ok(!existsSync(join(ws, ".pi", "mcp.json")), "stale mcp.json must be removed");
+    assert.ok(!targets.includes(join(shared, "mcp.json")));
+    // And a second refresh stays clean.
+    prepareAgentDir(ws, shared);
+    assert.ok(!existsSync(join(ws, ".pi", "mcp.json")));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -554,9 +632,8 @@ test("real launcher: per-task .pi symlinks are readable, shared dir writes denie
       [
         "cat >/dev/null",
         "cat .pi/npm/pkg/index.js",
-        // Prefix the content: a bare `{"servers":1}` line is valid JSON and
-        // would be consumed (and dropped) by the runner's JSONL parser.
-        'echo "mcp-content: $(cat .pi/mcp.json)"',
+        // mcp.json is no longer copied or linked (Phase 2): reading it fails.
+        'if cat .pi/mcp.json 2>/dev/null; then echo "mcp-content: $(cat .pi/mcp.json)"; else echo mcp-absent; fi',
         "if cat .pi/auth.json 2>/dev/null; then echo auth-leak; else echo auth-denied; fi",
         `if echo x > ${join(shared, "mcp.json")} 2>/dev/null; then echo shared-write-leak; else echo shared-write-denied; fi`,
       ].join("\n"),
@@ -577,12 +654,10 @@ test("real launcher: per-task .pi symlinks are readable, shared dir writes denie
     await waitDone(store, task.id, 15000);
     assert.equal(task.status, "succeeded", task.error ?? "");
     assert.match(task.output, /module\.exports = 42/);
-    assert.match(task.output, /mcp-content: \{"servers":1\}/);
-    // mcp.json is COPIED into the per-task dir (writable), not symlinked.
+    assert.match(task.output, /mcp-absent/);
+    // No per-task mcp.json copy or symlink exists any more.
     const wsCopy = join(runner.workspaceFor(task), ".pi", "mcp.json");
-    assert.ok(existsSync(wsCopy), "per-task .pi/mcp.json copy missing");
-    assert.equal(readFileSync(wsCopy, "utf8"), '{"servers":1}\n');
-    assert.ok(!lstatSync(wsCopy).isSymbolicLink(), "mcp.json must be a copy, not a symlink");
+    assert.ok(!existsSync(wsCopy), "per-task .pi/mcp.json must not exist");
     assert.match(task.output, /auth-denied/);
     assert.match(task.output, /shared-write-denied/);
     assert.equal(readFileSync(join(shared, "mcp.json"), "utf8"), '{"servers":1}\n');
@@ -631,6 +706,291 @@ test("real launcher: task token reaches the worker, service env does not", async
     assert.ok(!procDump.includes("sk-or-test"));
     assert.equal(tokens.resolve(match![1]), undefined);
     await runner.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- Phase 2: composition at spawn ---
+
+test("execute copies command sources into the tool-cache and passes resolved tools", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "isidore-runner-"));
+  try {
+    const store = new TaskStore(join(dir, "tasks"));
+    const registry = new ToolRegistry(join(dir, "tools"), {});
+    const manifest = registry.create(
+      {
+        name: "echoer",
+        kind: "command",
+        description: "echo text",
+        input_schema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+        command: { argv: ["echo", "{{text}}"], files: { "run.sh": "#!/bin/sh\necho cached-source\n", "lib/helper.sh": "echo helper\n" } },
+      },
+      { scope: "conversation", rootId: "t_conv", taskId: "t_conv-1", origin: "task" },
+    );
+    const script = fakeWorker(dir, "cat > request.json\n");
+    const runner = new Runner({
+      store,
+      workspaceRoot: join(dir, "ws"),
+      workerScript: script,
+      workerBin: "sh",
+      maxWorkers: 1,
+      timeout: null,
+      model: null,
+      mode: "print",
+      unsafeNoSandbox: true,
+      registry,
+      toolCacheRoot: join(dir, "tool-cache"),
+    });
+    // Pin the conversation root so the cache layout is predictable.
+    const task = runner.create("compose", { thread_id: "t_conv" });
+    await waitDone(store, task.id);
+    assert.equal(task.status, "succeeded");
+    const request = JSON.parse(readFileSync(join(runner.workspaceFor(task), "request.json"), "utf8"));
+    assert.ok(Array.isArray(request.tools));
+    const resolved = request.tools.find((tool: { manifest: { id: string } }) => tool.manifest.id === manifest.id);
+    assert.ok(resolved, "resolved tool missing from the worker request");
+    const cachePath = join(dir, "tool-cache", "t_conv", manifest.id, "1");
+    assert.equal(resolved.cachePath, cachePath);
+    assert.equal(readFileSync(join(cachePath, "run.sh"), "utf8"), "#!/bin/sh\necho cached-source\n");
+    assert.equal(readFileSync(join(cachePath, "lib", "helper.sh"), "utf8"), "echo helper\n");
+    // Sources are executable and the Landlock cache rule is --rx, so a shebang
+    // script named as argv[0] runs directly under the sandbox.
+    assert.ok(statSync(join(cachePath, "run.sh")).mode & 0o111);
+    // Builtin informational entries travel too, with no cache copy.
+    const builtin = request.tools.find((tool: { manifest: { id: string } }) => tool.manifest.id === "builtin:codemode");
+    assert.ok(builtin);
+    assert.equal(builtin.cachePath, null);
+    await runner.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tool-cache copies are immutable: an existing version dir is never rewritten", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "isidore-runner-"));
+  try {
+    const store = new TaskStore(join(dir, "tasks"));
+    const registry = new ToolRegistry(join(dir, "tools"), {});
+    const manifest = registry.create(
+      {
+        name: "echoer",
+        kind: "command",
+        description: "echo text",
+        input_schema: { type: "object", properties: {} },
+        command: { argv: ["echo", "hi"], files: { "run.sh": "#!/bin/sh\necho v1\n" } },
+      },
+      { scope: "conversation", rootId: "t_fixed", taskId: "t_fixed-1", origin: "task" },
+    );
+    // Pre-existing cache copy (e.g. staged by an earlier spawn): sentinel must survive.
+    const cachePath = join(dir, "tool-cache", "t_fixed", manifest.id, "1");
+    mkdirSync(cachePath, { recursive: true });
+    writeFileSync(join(cachePath, "sentinel.txt"), "do-not-touch");
+    const script = fakeWorker(dir, "cat > request.json\n");
+    const runner = new Runner({
+      store,
+      workspaceRoot: join(dir, "ws"),
+      workerScript: script,
+      workerBin: "sh",
+      maxWorkers: 1,
+      timeout: null,
+      model: null,
+      mode: "print",
+      unsafeNoSandbox: true,
+      registry,
+      toolCacheRoot: join(dir, "tool-cache"),
+    });
+    const task = createTask("immutable", { id: "t_fixed", thread_id: "t_fixed" });
+    runner.submit(task);
+    await waitDone(store, task.id);
+    assert.equal(task.status, "succeeded");
+    assert.equal(readFileSync(join(cachePath, "sentinel.txt"), "utf8"), "do-not-touch");
+    assert.ok(!existsSync(join(cachePath, "run.sh")), "absent-only copy must not fill in an existing dir");
+    const request = JSON.parse(readFileSync(join(runner.workspaceFor(task), "request.json"), "utf8"));
+    const resolved = request.tools.find((tool: { manifest: { id: string } }) => tool.manifest.id === manifest.id);
+    assert.equal(resolved.cachePath, cachePath);
+    await runner.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("startup sweeps crash-orphaned .tmp-* staging dirs in the tool-cache", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "isidore-runner-"));
+  try {
+    const cacheRoot = join(dir, "tool-cache");
+    const toolDir = join(cacheRoot, "t_conv", "tl_0123456789ab");
+    const orphan = join(toolDir, ".tmp-deadbeef");
+    mkdirSync(orphan, { recursive: true });
+    writeFileSync(join(orphan, "run.sh"), "partial staging");
+    const versionDir = join(toolDir, "1");
+    mkdirSync(versionDir, { recursive: true });
+    writeFileSync(join(versionDir, "run.sh"), "#!/bin/sh\necho v1\n");
+    const options = {
+      store: new TaskStore(join(dir, "tasks")),
+      workspaceRoot: join(dir, "ws"),
+      workerScript: fakeWorker(dir, "true"),
+      workerBin: "sh",
+      maxWorkers: 1,
+      timeout: null,
+      model: null,
+      mode: "print" as const,
+      unsafeNoSandbox: true,
+    };
+    const runner = new Runner({ ...options, toolCacheRoot: cacheRoot });
+    // The orphan is swept; the immutable version dir is untouched.
+    assert.ok(!existsSync(orphan));
+    assert.equal(readFileSync(join(versionDir, "run.sh"), "utf8"), "#!/bin/sh\necho v1\n");
+    // A missing cache root is fine (nothing to sweep).
+    const absent = new Runner({ ...options, toolCacheRoot: join(dir, "absent-cache") });
+    await runner.close();
+    await absent.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("real launcher: tool-cache readable, /state/tools denied, cache not writable", async () => {
+  assert.ok(existsSync(SANDBOX_BIN), `missing ${SANDBOX_BIN} — run: make -C sandbox (npm pretest does this)`);
+  const dir = mkdtempSync(join(tmpdir(), "isidore-runner-"));
+  const state = mkdtempSync(join(tmpdir(), "isidore-state-"));
+  try {
+    const store = new TaskStore(join(state, "tasks"));
+    const registry = new ToolRegistry(join(state, "tools"), {});
+    const manifest = registry.create(
+      {
+        name: "echoer",
+        kind: "command",
+        description: "echo text",
+        input_schema: { type: "object", properties: { text: { type: "string" } } },
+        command: { argv: ["echo", "{{text}}"], files: { "hello.sh": "#!/bin/sh\necho hello-from-cache\n" } },
+      },
+      { scope: "conversation", rootId: "t_conv", taskId: "t_conv-1", origin: "task" },
+    );
+    const sourceFile = join(state, "tools", manifest.id, "1", "files", "hello.sh");
+    // The fake worker extracts cachePath from the stdin request, then probes
+    // the cache (read ok, write denied) and the registry (read denied).
+    const script = fakeWorker(
+      dir,
+      [
+        "cat > request.json",
+        `cache=$(grep -o '"cachePath":"[^"]*"' request.json | head -n 1 | cut -d'"' -f4)`,
+        'if cat "$cache/hello.sh" >/dev/null 2>&1; then echo cache-read-ok; else echo cache-read-denied; fi',
+        'if echo x > "$cache/new.txt" 2>/dev/null; then echo cache-write-leak; else echo cache-write-denied; fi',
+        `if cat ${sourceFile} >/dev/null 2>&1; then echo tools-read-leak; else echo tools-read-denied; fi`,
+        `if echo x > ${join(state, "tools", "new.txt")} 2>/dev/null; then echo tools-write-leak; else echo tools-write-denied; fi`,
+      ].join("\n"),
+    );
+    const runner = new Runner({
+      store,
+      workspaceRoot: join(state, "ws"),
+      workerScript: script,
+      workerBin: "sh",
+      maxWorkers: 1,
+      timeout: null,
+      model: null,
+      mode: "print",
+      sandboxBin: SANDBOX_BIN,
+      agentDir: join(state, "shared-pi"),
+      registry,
+      toolCacheRoot: join(state, "tool-cache"),
+    });
+    const task = runner.create("cache", { thread_id: "t_conv" });
+    await waitDone(store, task.id, 15000);
+    assert.equal(task.status, "succeeded", task.error ?? "");
+    assert.match(task.output, /cache-read-ok/);
+    assert.match(task.output, /cache-write-denied/);
+    assert.match(task.output, /tools-read-denied/);
+    assert.match(task.output, /tools-write-denied/);
+    assert.ok(!task.output.includes("leak"));
+    assert.ok(!existsSync(join(state, "tools", "new.txt")));
+    // The service-side copy landed in the cache, executable, source untouched.
+    const cacheFile = join(state, "tool-cache", "t_conv", manifest.id, "1", "hello.sh");
+    assert.equal(readFileSync(cacheFile, "utf8"), "#!/bin/sh\necho hello-from-cache\n");
+    assert.ok(!existsSync(join(state, "tool-cache", "t_conv", manifest.id, "1", "new.txt")));
+    await runner.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(state, { recursive: true, force: true });
+  }
+});
+
+test("cancel sweeps detached command-tool grandchildren (whole process tree)", { skip: process.platform !== "linux" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "isidore-runner-"));
+  const pidFile = join(dir, "grandchild.pid");
+  const logFile = join(dir, "grandchild.log");
+  let grandchild: number | null = null;
+  try {
+    const store = new TaskStore(join(dir, "tasks"));
+    // Mimic registry-extension runCommand: the worker spawns a DETACHED
+    // (setsid) background loop — its own session/group, OUTSIDE the worker's
+    // group — then stays alive so the task can be cancelled mid-run. The loop
+    // records its pid and heartbeats into a marker file.
+    const script = fakeWorker(
+      dir,
+      [
+        "cat >/dev/null",
+        `setsid sh -c 'echo $$ > "${pidFile}"; while true; do echo alive >> "${logFile}"; sleep 0.2; done' &`,
+        "sleep 30",
+      ].join("\n"),
+    );
+    const runner = new Runner({
+      store,
+      workspaceRoot: join(dir, "ws"),
+      workerScript: script,
+      workerBin: "sh",
+      maxWorkers: 1,
+      timeout: null,
+      model: null,
+      mode: "json",
+      unsafeNoSandbox: true,
+    });
+    try {
+      const task = runner.create("detached-grandchild");
+      // Wait until the detached grandchild is up and heartbeating.
+      const start = Date.now();
+      while (Date.now() - start < 5000) {
+        if (existsSync(pidFile) && existsSync(logFile)) break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.ok(existsSync(pidFile), "detached grandchild never started");
+      grandchild = Number.parseInt(readFileSync(pidFile, "utf8").trim(), 10);
+      assert.ok(Number.isInteger(grandchild) && grandchild > 0);
+      assert.equal(task.status, "running");
+      assert.ok(runner.cancel(task.id));
+      await waitDone(store, task.id);
+      assert.equal(task.status, "cancelled");
+      // The detached grandchild must be swept, not orphaned: its pid is gone
+      // (or an unreaped zombie) shortly after the cancel.
+      let gone = false;
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        if (processGone(grandchild)) {
+          gone = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.ok(gone, `detached grandchild ${grandchild} survived cancel`);
+      // And its heartbeat marker stops growing.
+      const size = statSync(logFile).size;
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      assert.equal(statSync(logFile).size, size);
+    } finally {
+      // Belt and braces: sweep the loop BEFORE close() so a regression fails
+      // fast instead of hanging close() on the grandchild's inherited stdout
+      // pipe (an orphan keeps the worker's stdio open forever).
+      if (grandchild !== null) {
+        for (const target of [grandchild, -grandchild]) {
+          try {
+            process.kill(target, "SIGKILL");
+          } catch {
+            // already gone
+          }
+        }
+      }
+      await runner.close();
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

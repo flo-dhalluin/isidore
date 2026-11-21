@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createApp } from "../src/server.ts";
-import type { Settings } from "../src/config.ts";
+import { tasksDir, toolCacheDir, toolsDir, type Settings } from "../src/config.ts";
+import { TaskStore, createTask, utcnow } from "../src/store.ts";
+import { ToolRegistry, type ToolInput } from "../src/tools.ts";
 
 const ADMIN = "test-token";
 const adminAuth = { authorization: `Bearer ${ADMIN}` };
@@ -288,6 +290,53 @@ test("own-conversation DELETE keeps the running-turn 409 guard", async () => {
     const cancelled = await app.inject({ method: "POST", url: `/api/tasks/${task.id}/cancel`, headers: bearer(token) });
     assert.equal(cancelled.statusCode, 200);
     await waitForTerminal(app, task.id);
+  } finally {
+    await app.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("deleting a conversation cascades its registry tools and tool-cache dir", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "isidore-server-"));
+  const settings = settingsFor(dir);
+  // Seed a finished conversation and its tools BEFORE createApp so the app's
+  // registry loads them (mirrors tools authored while the conversation lived).
+  const store = new TaskStore(tasksDir(settings), settings.maxOutput);
+  const seeded = createTask("seed", { id: "t_cascade" });
+  seeded.status = "succeeded";
+  seeded.finished_at = utcnow();
+  store.add(seeded);
+  const input = (name: string): ToolInput => ({
+    name,
+    kind: "command",
+    description: `cascade ${name}`,
+    input_schema: { type: "object", properties: {} },
+    command: { argv: ["echo", "hi"], files: { "run.sh": "#!/bin/sh\necho hi\n" } },
+  });
+  const registry = new ToolRegistry(toolsDir(settings), {});
+  const mine = registry.create(input("convtool"), { scope: "conversation", rootId: "t_cascade", taskId: "t_cascade", origin: "task" });
+  const mineTask = registry.create(input("tasktool"), { scope: "task", rootId: "t_cascade", taskId: "t_cascade-2", origin: "task" });
+  const other = registry.create(input("othertool"), { scope: "conversation", rootId: "t_other", taskId: "t_other", origin: "task" });
+  // The runner's spawn-time cache copies for the conversation.
+  const cacheDir = join(toolCacheDir(settings), "t_cascade", mine.id, "1");
+  mkdirSync(cacheDir, { recursive: true });
+  writeFileSync(join(cacheDir, "run.sh"), "#!/bin/sh\necho hi\n");
+  const { app } = await createApp(settings);
+  try {
+    const deleted = await app.inject({ method: "DELETE", url: "/api/tasks/t_cascade", headers: adminAuth });
+    assert.equal(deleted.statusCode, 204);
+    // Registry records (index + version dirs) are gone for BOTH owned scopes…
+    assert.ok(!existsSync(join(toolsDir(settings), mine.id)));
+    assert.ok(!existsSync(join(toolsDir(settings), mineTask.id)));
+    // …and so is the conversation's tool-cache dir.
+    assert.ok(!existsSync(join(toolCacheDir(settings), "t_cascade")));
+    // A fresh registry no longer resolves the deleted conversation's tools.
+    const fresh = new ToolRegistry(toolsDir(settings), {});
+    assert.equal(fresh.get(mine.id), undefined);
+    assert.equal(fresh.get(mineTask.id), undefined);
+    // Other conversations are untouched.
+    assert.ok(existsSync(join(toolsDir(settings), other.id, "index.json")));
+    assert.ok(fresh.get(other.id));
   } finally {
     await app.close();
     rmSync(dir, { recursive: true, force: true });

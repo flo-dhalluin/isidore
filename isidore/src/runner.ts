@@ -1,10 +1,11 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createTask, isDone, rootId, type Task, type TaskStore, utcnow } from "./store.ts";
 import { TokenRegistry } from "./tokens.ts";
-
-const MAX_EVENT_TEXT = 4_000;
+import { builtinManifests, type ResolvedTool, type ToolRegistry } from "./tools.ts";
+import { MAX_EVENT_TEXT } from "./limits.ts";
 
 export interface RunnerOptions {
   store: TaskStore;
@@ -25,6 +26,14 @@ export interface RunnerOptions {
   unsafeNoSandbox?: boolean;
   /** Shared Pi agent dir; defaults to baseEnv.PI_CODING_AGENT_DIR ?? "/state/pi" (Worker A). */
   agentDir?: string;
+  /** Tool registry; when set, execute() composes the task's tools at spawn (Phase 2). */
+  registry?: ToolRegistry;
+  /**
+   * Root of the per-conversation read-only tool cache. Defaults to
+   * <ISIDORE_STATE ?? /state>/tool-cache (config.ts toolCacheDir semantics);
+   * createApp passes toolCacheDir(settings) explicitly. Injectable for tests.
+   */
+  toolCacheRoot?: string;
 }
 
 export interface WorkerRequest {
@@ -38,10 +47,17 @@ export interface WorkerRequest {
    * from process.env. Additive field; the JSONL output contract is untouched.
    */
   apiKey?: string | null;
+  /** Resolved tool set composed at spawn (Phase 2); additive, JSONL untouched. */
+  tools?: ResolvedTool[];
 }
 
-export function buildWorkerRequest(task: Task, model: string | null, apiKey: string | null = null): WorkerRequest {
-  return { prompt: task.prompt, model: task.model ?? model, sessionId: rootId(task), apiKey };
+export function buildWorkerRequest(
+  task: Task,
+  model: string | null,
+  apiKey: string | null = null,
+  tools?: ResolvedTool[],
+): WorkerRequest {
+  return { prompt: task.prompt, model: task.model ?? model, sessionId: rootId(task), apiKey, ...(tools ? { tools } : {}) };
 }
 
 /**
@@ -74,7 +90,7 @@ export function buildWorkerRequest(task: Task, model: string | null, apiKey: str
  * EACCES (uv_resident_set_memory). The alternative (--ro /proc wholesale)
  * would leak the service's environ to every task — unacceptable.
  */
-export function buildSandboxArgs(workspace: string, agentDirTargets: string[]): string[] {
+export function buildSandboxArgs(workspace: string, agentDirTargets: string[], toolCacheDirs: string[] = []): string[] {
   const args: string[] = ["--rw", workspace];
   for (const path of ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/opt/isidore"]) {
     args.push("--rx", path);
@@ -95,6 +111,12 @@ export function buildSandboxArgs(workspace: string, agentDirTargets: string[]): 
     args.push("--ro", path);
   }
   for (const target of agentDirTargets) args.push("--ro", target);
+  // Per-conversation tool-cache copies (Phase 2): read + execute, NO write.
+  // The copies are service-written and immutable to the task, so execute is
+  // security-neutral (the workspace is already rw+exec) and lets command
+  // tools run shebang scripts directly. /state/tools itself is NEVER listed:
+  // the registry stays service-only, workers read the cache.
+  for (const path of toolCacheDirs) args.push("--rx", path);
   for (const path of ["/dev/null", "/dev/urandom", "/dev/zero", "/dev/tty"]) {
     args.push("--rw", path);
   }
@@ -102,7 +124,7 @@ export function buildSandboxArgs(workspace: string, agentDirTargets: string[]): 
 }
 
 /** Shared agent-dir entries a task must never see (secrets, other sessions, state). */
-const AGENT_DIR_DENYLIST = new Set(["auth.json", "sessions", "web-search-cache", ".seed", "tmp"]);
+const AGENT_DIR_DENYLIST = new Set(["auth.json", "sessions", "web-search-cache", ".seed", "tmp", "mcp.json"]);
 /**
  * Small config files copied per task (writable); everything else is symlinked
  * read-only.
@@ -123,6 +145,10 @@ const AGENT_DIR_COPIES = new Set(["models.json", "models-store.json", "mcp.json"
 export function prepareAgentDir(workspace: string, sharedAgentDir: string): string[] {
   const dir = join(workspace, ".pi");
   mkdirSync(dir, { recursive: true });
+  // MCP servers are registered per worker by the registry extension (Phase 2);
+  // a shared mcp.json is neither copied nor linked. Drop stale per-task copies
+  // left over from earlier spawns so they cannot shadow builtin servers.
+  rmSync(join(dir, "mcp.json"), { force: true });
   // Pi writes search results here at runtime; give each task its own.
   mkdirSync(join(dir, "web-search-cache"), { recursive: true });
   const targets: string[] = [];
@@ -191,16 +217,69 @@ export function summariseEvent(record: Record<string, unknown>): string | null {
   return event.type === "text_delta" ? ((event.delta as string) ?? null) : null;
 }
 
+/**
+ * All descendant pids of `pid` (children, grandchildren, ...) via
+ * /proc/<p>/task/<p>/children. The service runs UNSANDBOXED, so it can walk
+ * /proc even though workers cannot. Linux-only: where the file is missing
+ * (non-Linux, or a process that exited mid-walk) the read is skipped and the
+ * caller falls back to the plain group kill. The visited set bounds the walk
+ * even if pids are recycled underneath us.
+ */
+function descendants(pid: number): number[] {
+  const seen = new Set<number>();
+  const stack = [pid];
+  const found: number[] = [];
+  while (stack.length > 0) {
+    const current = stack.pop() as number;
+    let children: number[];
+    try {
+      children = readFileSync(`/proc/${current}/task/${current}/children`, "utf8")
+        .split(/\s+/)
+        .map((entry) => Number.parseInt(entry, 10))
+        .filter((child) => Number.isInteger(child) && child > 0 && !seen.has(child));
+    } catch {
+      continue; // unreadable (exited mid-walk or no /proc): skip this branch
+    }
+    for (const child of children) {
+      seen.add(child);
+      found.push(child);
+      stack.push(child);
+    }
+  }
+  return found;
+}
+
 function kill(proc: ChildProcess): void {
   if (proc.pid === undefined) return;
+  // Command tools spawn detached (their OWN process groups), so killing the
+  // worker's group alone leaves them — and any daemonized grandchildren —
+  // alive. The service is unsandboxed and can read /proc: enumerate the whole
+  // tree FIRST, while the worker is still alive (once it dies its children
+  // reparent to pid 1 and the /proc tree link is lost), then kill the worker
+  // group, then sweep every collected pid individually plus any detached
+  // group it leads. On non-Linux descendants() is [] and this degrades to the
+  // original group kill.
+  const tree = descendants(proc.pid);
   try {
-    // The worker is a process-group leader (detached), so this kills its tree.
+    // The worker is a process-group leader (detached), so this kills its group.
     process.kill(-proc.pid, "SIGKILL");
   } catch {
     try {
       proc.kill("SIGKILL");
     } catch {
       // already gone
+    }
+  }
+  for (const pid of tree) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // ESRCH/EINVAL/EPERM: already gone or unreachable
+    }
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      // not a group leader / already gone
     }
   }
 }
@@ -221,6 +300,8 @@ export class Runner {
   private readonly sandboxBin: string | null;
   private readonly unsafeNoSandbox: boolean;
   private readonly agentDir: string;
+  private readonly registry: ToolRegistry | null;
+  private readonly toolCacheRoot: string;
   private readonly procs = new Map<string, ChildProcess>();
   private readonly jobs = new Set<Promise<void>>();
   private active = 0;
@@ -242,6 +323,9 @@ export class Runner {
     this.sandboxBin = options.sandboxBin ?? null;
     this.unsafeNoSandbox = options.unsafeNoSandbox ?? false;
     this.agentDir = options.agentDir ?? this.baseEnv.PI_CODING_AGENT_DIR ?? "/state/pi";
+    this.registry = options.registry ?? null;
+    this.toolCacheRoot = options.toolCacheRoot ?? join(this.baseEnv.ISIDORE_STATE ?? "/state", "tool-cache");
+    this.sweepToolCacheStaging();
     if (this.unsafeNoSandbox) {
       console.error("======================================================================");
       console.error("isidore: ISIDORE_UNSAFE_NO_SANDBOX=1 — workers run WITHOUT the");
@@ -252,6 +336,43 @@ export class Runner {
       console.error(
         `isidore: sandbox binary ${this.sandboxBin ?? "(unset)"} not found — tasks will FAIL CLOSED until it exists (or ISIDORE_UNSAFE_NO_SANDBOX=1).`,
       );
+    }
+  }
+
+  /**
+   * Sweep crash-orphaned .tmp-* staging dirs in the tool-cache (a crash between
+   * mkdir and rename in stageToolCache). Scoped to the cache's staging layout
+   * <toolCacheRoot>/<rootId>/<toolId>/.tmp-*; immutable version dirs are never
+   * touched. One cheap pass at startup so orphans neither accumulate nor trip
+   * the --rx cache rule.
+   */
+  private sweepToolCacheStaging(): void {
+    let conversations: string[];
+    try {
+      conversations = readdirSync(this.toolCacheRoot);
+    } catch {
+      return; // no cache root yet: nothing to sweep
+    }
+    for (const conversation of conversations) {
+      const conversationDir = join(this.toolCacheRoot, conversation);
+      let toolIds: string[];
+      try {
+        toolIds = readdirSync(conversationDir);
+      } catch {
+        continue;
+      }
+      for (const toolId of toolIds) {
+        const toolDir = join(conversationDir, toolId);
+        let entries: string[];
+        try {
+          entries = readdirSync(toolDir);
+        } catch {
+          continue;
+        }
+        for (const entry of entries) {
+          if (entry.startsWith(".tmp-")) rmSync(join(toolDir, entry), { recursive: true, force: true });
+        }
+      }
     }
   }
 
@@ -288,6 +409,63 @@ export class Runner {
 
   workspaceFor(task: Task): string {
     return join(this.workspaceRoot, rootId(task));
+  }
+
+  /**
+   * Compose the task's tool set at spawn (Phase 2): registry resolution
+   * (active globals + conversation + task tools, pinned inherited versions,
+   * builtins) or just the builtins when no registry is configured.
+   */
+  private resolveTools(task: Task): ResolvedTool[] {
+    if (!this.registry) {
+      return builtinManifests(this.baseEnv).map((manifest) => ({ manifest, cachePath: null }));
+    }
+    // Task.inherited_tools arrives with Phase 3 lineage; read it defensively
+    // so pinned inheritance already works once the field exists.
+    const inherited =
+      (task as Task & { inherited_tools?: Array<{ id: string; version: number }> | null }).inherited_tools ?? undefined;
+    const warnings: string[] = [];
+    const resolved = this.registry.resolveFor({ rootId: rootId(task), taskId: task.id, inherited }, warnings);
+    for (const warning of warnings) console.error(`isidore: tool resolution: ${warning}`);
+    return resolved;
+  }
+
+  /**
+   * Copy command/extension sources from the service-only registry into the
+   * per-conversation read-only tool-cache: <toolCacheRoot>/<rootId>/<id>/<v>/.
+   * Only if absent — versions are immutable, so an existing copy is never
+   * rewritten (staging dir + rename, same pattern as the registry itself).
+   * Sets ResolvedTool.cachePath. Files are chmod'd executable; the Landlock
+   * cache rule is --rx (read + execute, no write), so a cached shebang script
+   * can be exec'd directly as argv[0] while the copies stay tamper-resistant.
+   */
+  private stageToolCache(resolved: ResolvedTool[], rootId: string): void {
+    for (const tool of resolved) {
+      const manifest = tool.manifest;
+      if (manifest.kind !== "command" && manifest.kind !== "extension") continue;
+      if (manifest.id.startsWith("builtin:")) continue; // builtins carry no sources
+      const dest = join(this.toolCacheRoot, rootId, manifest.id, String(manifest.version));
+      tool.cachePath = dest;
+      if (existsSync(dest)) continue;
+      const parent = dirname(dest);
+      mkdirSync(parent, { recursive: true });
+      const stage = join(parent, `.tmp-${randomBytes(6).toString("hex")}`);
+      mkdirSync(stage, { recursive: true });
+      try {
+        const source = this.registry?.filesDir(manifest.id, manifest.version);
+        if (source && existsSync(source)) {
+          cpSync(source, stage, { recursive: true });
+          for (const entry of readdirSync(stage, { recursive: true, withFileTypes: true })) {
+            if (entry.isFile()) chmodSync(join(entry.parentPath ?? stage, entry.name), 0o755);
+          }
+        }
+        renameSync(stage, dest);
+      } catch (error) {
+        rmSync(stage, { recursive: true, force: true });
+        // A concurrent spawn may have won the race; an existing copy is fine.
+        if (!existsSync(dest)) throw error;
+      }
+    }
   }
 
   private notify(task: Task): void {
@@ -372,7 +550,9 @@ export class Runner {
     this.store.update(task);
     this.notify(task);
 
-    const request = buildWorkerRequest(task, this.model, this.baseEnv.OPENROUTER_API_KEY ?? null);
+    const resolved = this.resolveTools(task);
+    this.stageToolCache(resolved, rootId(task));
+    const request = buildWorkerRequest(task, this.model, this.baseEnv.OPENROUTER_API_KEY ?? null, resolved);
     // In dev the worker is TypeScript; Node runs it with type stripping.
     const workerArgs = this.workerScript.endsWith(".ts")
       ? ["--experimental-strip-types", this.workerScript]
@@ -399,9 +579,14 @@ export class Runner {
           );
         }
         const targets = prepareAgentDir(workspace, this.agentDir);
+        // The conversation's tool-cache dir is readable/executable when it
+        // holds copies; /state/tools itself stays unlisted (deny-by-default).
+        const cacheDir = join(this.toolCacheRoot, rootId(task));
+        const toolCacheDirs =
+          existsSync(cacheDir) && readdirSync(cacheDir).length > 0 ? [cacheDir] : [];
         bin = this.sandboxBin;
         args = [
-          ...buildSandboxArgs(workspace, targets),
+          ...buildSandboxArgs(workspace, targets, toolCacheDirs),
           // The worker script itself must be readable/executable (in production
           // this is /opt/isidore/dist, already covered; in tests it is a tmpdir).
           // NOTE: this grants read to the WHOLE script directory, so never

@@ -2,13 +2,14 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import { timingSafeEqual } from "node:crypto";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
-import { generateAdminToken, tasksDir, workspacesDir, writeAdminToken, type Settings } from "./config.ts";
+import { generateAdminToken, tasksDir, toolCacheDir, toolsDir, workspacesDir, writeAdminToken, type Settings } from "./config.ts";
 import { Runner } from "./runner.ts";
 import { SchedulerClient } from "./scheduler.ts";
 import { TelegramBot } from "./telegram.ts";
 import { TaskStore, isDone, publicTask, rootId } from "./store.ts";
 import { renderTemplate } from "./templates.ts";
 import { TokenRegistry, type TaskScope } from "./tokens.ts";
+import { ToolRegistry } from "./tools.ts";
 
 const MAX_PROMPT = 100_000;
 
@@ -58,6 +59,10 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
   }
 
   const store = new TaskStore(tasksDir(settings), settings.maxOutput);
+  // Tool registry (Phase 2): the runner composes each task's tools at spawn
+  // and copies command sources into the read-only per-conversation tool-cache.
+  const registry = new ToolRegistry(toolsDir(settings));
+  const toolCacheRoot = toolCacheDir(settings);
   const scheduler = new SchedulerClient(settings.schedulerUrl, settings.schedulerToken, undefined, settings.schedulerTokenFile);
   let bot: TelegramBot | null = null;
 
@@ -74,6 +79,8 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
     tokens,
     sandboxBin: settings.sandboxBin,
     unsafeNoSandbox: settings.unsafeNoSandbox,
+    registry,
+    toolCacheRoot,
   });
 
   if (settings.telegramToken) {
@@ -189,8 +196,22 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
     if (turns.some((turn) => !isDone(turn))) {
       return reply.code(409).send({ error: "cannot delete a conversation while a turn is running" });
     }
+    const root = rootId(task);
     for (const turn of turns) store.remove(turn.id);
-    rmSync(join(workspacesDir(settings), rootId(task)), { recursive: true, force: true });
+    rmSync(join(workspacesDir(settings), root), { recursive: true, force: true });
+    // Cascade the conversation's tools: registry records (indexes + version
+    // dirs) and its read-only tool-cache copies. Cleanup failures are logged
+    // but must never fail the delete itself.
+    try {
+      registry.removeConversation(root);
+    } catch (error) {
+      console.error(`isidore: tool registry cleanup for ${root} failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    try {
+      rmSync(join(toolCacheRoot, root), { recursive: true, force: true });
+    } catch (error) {
+      console.error(`isidore: tool-cache cleanup for ${root} failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
     return reply.code(204).send();
   });
 
