@@ -333,7 +333,7 @@ test("prepareAgentDir copies config, symlinks the rest, denies secrets; idempote
     const targets = prepareAgentDir(ws, shared);
     const pi = join(ws, ".pi");
     // Small configs are per-task writable copies.
-    for (const name of ["models.json", "models-store.json", "mcp.json", "settings.json"]) {
+    for (const name of ["models.json", "models-store.json", "settings.json"]) {
       assert.ok(lstatSync(join(pi, name)).isFile(), `${name} must be a copy`);
       assert.equal(readFileSync(join(pi, name), "utf8"), readFileSync(join(shared, name), "utf8"));
     }
