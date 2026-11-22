@@ -76,6 +76,13 @@ test("serves the UI, API and runs a task end to end", async () => {
     assert.match(index.body, /id="tools-link" href="\/tools"/);
     // Artifacts published with send_file are surfaced in the task list.
     assert.match(index.body, /fileCount/);
+    // The logo doubles as the favicon; the asset is public (no token needed).
+    assert.match(index.body, /<link rel="icon" type="image\/svg\+xml" href="\/loutre-tete.svg">/);
+    assert.match(index.body, /<img class="logo" src="\/loutre-tete.svg"/);
+    const logo = await app.inject({ method: "GET", url: "/loutre-tete.svg" });
+    assert.equal(logo.statusCode, 200);
+    assert.match(String(logo.headers["content-type"]), /image\/svg\+xml/);
+    assert.match(logo.body, /<svg/);
 
     const taskPage = await app.inject({ method: "GET", url: "/tasks/t_abc", headers: adminAuth });
     assert.equal(taskPage.statusCode, 200);

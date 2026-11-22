@@ -6,6 +6,11 @@ const TEMPLATE_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "templa
 
 const read = (name: string): string => readFileSync(join(TEMPLATE_DIR, name), "utf8");
 
+/** Read a static asset that ships next to the templates (e.g. the logo SVG). */
+export function readTemplateAsset(name: string): Buffer {
+  return readFileSync(join(TEMPLATE_DIR, name));
+}
+
 const stripComments = (text: string): string => text.replace(/\{#[\s\S]*?#\}/g, "");
 
 function extractBlocks(text: string): Map<string, string> {

@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 600" width="600" height="600">
+  <!-- 3 couleurs seulement : encre #2E1C14 / fourrure #B07A50 / creme #F3E3CE -->
+  <g fill="none" stroke="#2E1C14" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+
+    <!-- oreilles (petites, basses sur les cotes) -->
+    <circle cx="158" cy="252" r="28" fill="#B07A50"/>
+    <circle cx="442" cy="252" r="28" fill="#B07A50"/>
+
+    <!-- tete large et plate -->
+    <path fill="#B07A50" d="M300 150
+      C210 150 148 198 144 262
+      C140 330 196 404 300 410
+      C404 404 460 330 456 262
+      C452 198 390 150 300 150 Z"/>
+
+    <!-- museau large -->
+    <path fill="#F3E3CE" d="M300 288
+      C264 288 210 296 198 328
+      C188 356 214 388 258 394
+      C276 397 292 398 300 398
+      C308 398 324 397 342 394
+      C386 388 412 356 402 328
+      C390 296 336 288 300 288 Z"/>
+
+    <!-- yeux -->
+    <circle cx="258" cy="258" r="23" fill="#2E1C14" stroke="none"/>
+    <circle cx="342" cy="258" r="23" fill="#2E1C14" stroke="none"/>
+    <circle cx="251" cy="250" r="7" fill="#F3E3CE" stroke="none"/>
+    <circle cx="335" cy="250" r="7" fill="#F3E3CE" stroke="none"/>
+
+    <!-- nez -->
+    <path fill="#2E1C14" stroke="none" d="M262 297
+      C262 290 279 287 300 287
+      C321 287 338 290 338 297
+      C338 306 319 316 300 316
+      C281 316 262 306 262 297 Z"/>
+
+    <!-- bouche -->
+    <path d="M300 316 L300 336"/>
+    <path d="M300 336 C286 352 266 352 256 342"/>
+    <path d="M300 336 C314 352 334 352 344 342"/>
+
+    <!-- moustaches -->
+    <path stroke-width="5" d="M206 330 L158 318"/>
+    <path stroke-width="5" d="M202 346 L150 346"/>
+    <path stroke-width="5" d="M208 362 L160 374"/>
+    <path stroke-width="5" d="M394 330 L442 318"/>
+    <path stroke-width="5" d="M398 346 L450 346"/>
+    <path stroke-width="5" d="M392 362 L440 374"/>
+  </g>
+</svg>
