@@ -50,6 +50,8 @@
   .composer { max-width: 860px; margin: 0 auto; }
   textarea { width: 100%; background: transparent; color: inherit; border: 1px solid var(--line);
              padding: .55rem .6rem; font: inherit; min-height: 3.4rem; max-height: 12rem; resize: vertical; }
+  select { background: transparent; color: inherit; border: 1px solid var(--line);
+           padding: .55rem .6rem; font: inherit; }
   .row { display: flex; gap: .6rem; flex-wrap: wrap; margin-top: .6rem; align-items: center; }
   .row .grow { flex: 1 1 12rem; }
   button { background: var(--accent); color: #fff; border: 0; padding: .55rem .9rem; font: inherit; cursor: pointer; }
@@ -75,7 +77,8 @@
   <div class="composer">
     <textarea id="prompt" placeholder="Follow-up question…" required></textarea>
     <div class="row">
-      <input class="grow" id="model" placeholder="model override (optional)">
+      <select class="grow" id="model-select" hidden></select>
+      <input class="grow" id="model-input" placeholder="model override (optional)">
       <button type="submit" id="send">Send</button>
     </div>
     <p class="hint" id="hint"></p>
@@ -99,6 +102,35 @@ async function api(path, opts) {
 
 let lastSig = null;
 let lastTurns = 0;
+let modelPicker = null;
+let modelInfoLoaded = false;
+let modelReady = false;
+
+/** Use the server's model whitelist as a dropdown; keep free text when unset. */
+function setupModelPicker(info) {
+  modelInfoLoaded = true;
+  const models = Array.isArray(info.models) ? info.models : [];
+  if (!models.length) { modelReady = true; return; }
+  const select = $("model-select");
+  select.innerHTML = models.map((model) =>
+    `<option value="${esc(model)}"${model === info.default_model ? " selected" : ""}>${esc(model)}</option>`).join("");
+  select.hidden = false;
+  $("model-input").hidden = true;
+  modelPicker = select;
+}
+
+function chosenModel() {
+  return modelPicker ? (modelPicker.value || null) : ($("model-input").value || null);
+}
+
+/** Preselect the conversation's model once, so a follow-up keeps it. */
+function selectConversationModel(model) {
+  if (modelReady) return;
+  if (modelPicker && model && [...modelPicker.options].some((option) => option.value === model)) {
+    modelPicker.value = model;
+  }
+  modelReady = true;
+}
 
 const busy = (status) => status === "queued" || status === "running";
 const spinner = (status) => (busy(status) ? '<span class="spinner" aria-hidden="true"></span>' : "");
@@ -145,6 +177,7 @@ function turn(task) {
 function render(data) {
   $("root").textContent = data.id;
   const last = data.turns[data.turns.length - 1];
+  if (modelInfoLoaded) selectConversationModel(last ? last.model : null);
   $("status").innerHTML = last ? spinner(last.status) + esc(last.status) : "";
   $("status").className = "status " + (last ? last.status : "");
   const running = data.running;
@@ -185,7 +218,7 @@ $("ask").onsubmit = async (ev) => {
   $("send").disabled = true;
   try {
     await api("/api/tasks/" + encodeURIComponent(last.id) + "/followup",
-      {method: "POST", body: JSON.stringify({prompt: text, model: $("model").value || null})});
+      {method: "POST", body: JSON.stringify({prompt: text, model: chosenModel()})});
     $("prompt").value = "";
     refresh();
   } catch (e) { alert(e.message); }
@@ -207,8 +240,11 @@ $("delete").onclick = async () => {
   } catch (e) { alert(e.message); }
 };
 
-refresh();
-setInterval(refresh, 2000);
+(async () => {
+  try { setupModelPicker(await api("/api/info")); } catch (e) { /* keep free text */ }
+  refresh();
+  setInterval(refresh, 2000);
+})();
 
 
 {% include "_markdown.js" %}

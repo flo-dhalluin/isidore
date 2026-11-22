@@ -31,6 +31,10 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
   }
 
   const store = new TaskStore(tasksDir(settings), settings.maxOutput);
+  // Model whitelist (built-in MODEL_WHITELIST): empty means no restriction.
+  // The default model is always part of the whitelist.
+  const allowedModels = new Set(settings.models);
+  const modelAllowed = (model: string): boolean => allowedModels.size === 0 || allowedModels.has(model);
   // Tool registry (Phase 2): the runner composes each task's tools at spawn
   // and copies command sources into the read-only per-conversation tool-cache.
   // env + port feed builtinManifests (builtin:tools URL fallback, Phase 3).
@@ -120,6 +124,8 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
     return {
       scheduler: scheduler.enabled,
       model: settings.model,
+      default_model: settings.model,
+      models: settings.models,
       max_workers: settings.maxWorkers,
       telegram: Boolean(settings.telegramToken),
       telegram_mode: bot?.mode ?? null,
@@ -147,6 +153,9 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
       return reply.code(413).send({ error: `prompt is longer than ${MAX_PROMPT} characters` });
     }
     const model = body.model ? String(body.model) : null;
+    if (model && !modelAllowed(model)) {
+      return reply.code(400).send({ error: `model not allowed: ${model}` });
+    }
     if (auth.kind === "task") {
       // A task can only spawn a follow-up turn of its own conversation; body
       // origin/schedule_id/parent fields are ignored.
@@ -246,7 +255,12 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
     if (prompt.length > MAX_PROMPT) {
       return reply.code(413).send({ error: `prompt is longer than ${MAX_PROMPT} characters` });
     }
-    const model = body.model ?? parent.model;
+    let model = body.model ?? parent.model;
+    if (model && !modelAllowed(String(model))) {
+      if (body.model) return reply.code(400).send({ error: `model not allowed: ${String(model)}` });
+      // An inherited model that is no longer whitelisted falls back to the default.
+      model = null;
+    }
     const task = runner.create(prompt, {
       parent_id: parent.id,
       thread_id: rootId(parent),
@@ -287,6 +301,10 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
     if (!body || typeof body !== "object") return reply.code(400).send({ error: "expected a JSON object" });
     const prompt = String(body.prompt ?? "").trim();
     if (!prompt) return reply.code(400).send({ error: "prompt is required" });
+    const model = body.model ? String(body.model) : null;
+    if (model && !modelAllowed(model)) {
+      return reply.code(400).send({ error: `model not allowed: ${model}` });
+    }
     const conversationId = auth.kind === "task" ? auth.scope.rootId : null;
     try {
       const schedule = await scheduler.create(
@@ -294,7 +312,7 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
         {
           at: body.at ? String(body.at) : null,
           every: (body.every as string | number | undefined) ?? null,
-          model: body.model ? String(body.model) : null,
+          model,
         },
         conversationId,
       );

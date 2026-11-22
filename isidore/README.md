@@ -40,7 +40,9 @@ tenant or put each task in its own container.
 `http://127.0.0.1:8920/` (bound to loopback by compose). The page is a single
 HTML document: a prompt box, an optional model, and a task list, with — when
 the scheduler is configured — a sidebar listing the active schedules and their
-scheduled time (next run, with a relative hint). The list groups follow-ups
+scheduled time (next run, with a relative hint). The model field is a
+dropdown of the built-in whitelist (`src/models.ts`), with the default
+preselected. The list groups follow-ups
 under their root task; clicking a task opens a full-screen conversation page
 where you can read the transcript, cancel a running turn, ask follow-up
 questions, or delete a finished conversation (records **and** workspace). Each
@@ -55,10 +57,10 @@ REST API:
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/info` | feature flags (scheduler, telegram, model) |
+| `GET` | `/api/info` | feature flags (scheduler, telegram, model, model whitelist) |
 | `GET` | `/api/auth/whoami` | caller identity: `{admin:true}` or `{task_id, root_id, origin}` |
 | `GET` | `/api/tasks?limit=50&status=running` | list tasks |
-| `POST` | `/api/tasks` | `{prompt, model?, origin?, schedule_id?}` → 202 |
+| `POST` | `/api/tasks` | `{prompt, model?, origin?, schedule_id?}` → 202 (model must be whitelisted) |
 | `GET` | `/api/tasks/{id}` | one task, including output |
 | `DELETE` | `/api/tasks/{id}` | delete a finished conversation + workspace |
 | `GET` | `/api/tasks/{id}/thread` | every turn of a conversation, oldest first |
@@ -239,7 +241,7 @@ their results go back to the chat.
 |---|---|---|
 | `ISIDORE_STATE` | `/state` | tasks, workspaces, Pi config |
 | `ISIDORE_HOST` / `ISIDORE_PORT` | `0.0.0.0` / `8920` | listen address |
-| `ISIDORE_MODEL` | host default | model passed to the worker |
+| `ISIDORE_MODEL` | built-in default | default model override; must be in the built-in whitelist (`src/models.ts`) |
 | `ISIDORE_MAX_WORKERS` | `2` | concurrent tasks |
 | `ISIDORE_TASK_TIMEOUT` | none | seconds before a task is killed |
 | `ISIDORE_PI_MODE` | `print` | `print` (final answer) or `json` (full transcript); the worker always emits the event stream, so tool calls are captured either way |

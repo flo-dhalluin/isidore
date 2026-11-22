@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { createApp } from "../src/server.ts";
 import { tasksDir, toolCacheDir, toolsDir, workspacesDir, type Settings } from "../src/config.ts";
+import { DEFAULT_MODEL, MODEL_WHITELIST } from "../src/models.ts";
 import { TaskStore, createTask, utcnow } from "../src/store.ts";
 import { ToolRegistry, type ToolInput } from "../src/tools.ts";
 
@@ -20,7 +21,8 @@ function settingsFor(dir: string): Settings {
     host: "127.0.0.1",
     port: 0,
     token: ADMIN,
-    model: null,
+    model: DEFAULT_MODEL,
+    models: [...MODEL_WHITELIST],
     workerScript,
     workerBin: "sh",
     piMode: "print",
@@ -67,12 +69,16 @@ test("serves the UI, API and runs a task end to end", async () => {
     assert.equal(index.statusCode, 200);
     assert.match(index.body, /id="run"/);
     assert.match(index.body, /isidore/);
+    // The model field is a whitelist dropdown with a free-text fallback.
+    assert.match(index.body, /id="model-select"/);
+    assert.match(index.body, /id="model-input"/);
     // The index links to the tool registry page (token propagated client-side).
     assert.match(index.body, /id="tools-link" href="\/tools"/);
 
     const taskPage = await app.inject({ method: "GET", url: "/tasks/t_abc", headers: adminAuth });
     assert.equal(taskPage.statusCode, 200);
     assert.match(taskPage.body, /id="ask"/);
+    assert.match(taskPage.body, /id="model-select"/);
 
     const toolsPage = await app.inject({ method: "GET", url: "/tools", headers: adminAuth });
     assert.equal(toolsPage.statusCode, 200);
@@ -582,6 +588,69 @@ test("createApp generates a fallback admin token when settings.token is null", a
       (await app.inject({ method: "GET", url: "/api/info", headers: bearer(generated) })).statusCode,
       200,
     );
+  } finally {
+    await app.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("model whitelist is exposed and enforced on tasks and follow-ups", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "isidore-server-"));
+  const settings = settingsFor(dir);
+  settings.models = ["model-a", "model-b"];
+  settings.model = "model-b";
+  const { app } = await createApp(settings);
+  try {
+    const info = await app.inject({ method: "GET", url: "/api/info", headers: adminAuth });
+    assert.deepEqual(info.json().models, ["model-a", "model-b"]);
+    assert.equal(info.json().default_model, "model-b");
+
+    const rejected = await app.inject({
+      method: "POST",
+      url: "/api/tasks",
+      headers: adminAuth,
+      payload: { prompt: "hi", model: "model-c" },
+    });
+    assert.equal(rejected.statusCode, 400);
+
+    const accepted = await app.inject({
+      method: "POST",
+      url: "/api/tasks",
+      headers: adminAuth,
+      payload: { prompt: "hi", model: "model-a" },
+    });
+    assert.equal(accepted.statusCode, 202);
+    const task = await waitForTerminal(app, accepted.json().id);
+    assert.equal(task.model, "model-a");
+
+    const followup = await app.inject({
+      method: "POST",
+      url: `/api/tasks/${task.id}/followup`,
+      headers: adminAuth,
+      payload: { prompt: "again", model: "model-c" },
+    });
+    assert.equal(followup.statusCode, 400);
+  } finally {
+    await app.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("schedules proxy rejects a model outside the whitelist", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "isidore-server-"));
+  const settings = settingsFor(dir);
+  settings.schedulerUrl = "http://scheduler.test";
+  settings.schedulerToken = "sched-admin";
+  settings.models = ["model-a"];
+  const { app } = await createApp(settings);
+  try {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/schedules",
+      headers: adminAuth,
+      payload: { prompt: "hi", every: "1h", model: "model-b" },
+    });
+    assert.equal(response.statusCode, 400);
   } finally {
     await app.close();
     rmSync(dir, { recursive: true, force: true });

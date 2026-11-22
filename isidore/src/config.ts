@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { DEFAULT_MODEL, MODEL_WHITELIST } from "./models.ts";
 
 export interface Settings {
   stateDir: string;
@@ -8,7 +9,10 @@ export interface Settings {
   port: number;
   /** Always set by loadSettings (generated when ISIDORE_TOKEN is unset); null only for programmatic/test callers, which createApp backs up with a generated token. */
   token: string | null;
+  /** Default model passed to the worker when a task does not choose one. */
   model: string | null;
+  /** Built-in allowed models (MODEL_WHITELIST); empty means no whitelist. */
+  models: string[];
   workerScript: string;
   workerBin: string;
   piMode: "print" | "json";
@@ -86,12 +90,23 @@ export function loadSettings(): Settings {
   const workerFile = import.meta.url.endsWith(".ts") ? "worker.ts" : "worker.js";
   const envToken = process.env.ISIDORE_TOKEN || null;
   const token = envToken ?? generateAdminToken();
+  // The whitelist is built in (src/models.ts), never read from the environment.
+  const models = [...MODEL_WHITELIST];
+  // ISIDORE_MODEL may pick the default, but only from the built-in whitelist.
+  const requestedModel = process.env.ISIDORE_MODEL || null;
+  const model = requestedModel && models.includes(requestedModel) ? requestedModel : DEFAULT_MODEL;
+  if (requestedModel && !models.includes(requestedModel)) {
+    console.error(
+      `isidore: ISIDORE_MODEL=${requestedModel} is not in the built-in model whitelist; using ${DEFAULT_MODEL}`,
+    );
+  }
   const settings: Settings = {
     stateDir,
     host: process.env.ISIDORE_HOST ?? "0.0.0.0",
     port: envInt("ISIDORE_PORT", 8920),
     token,
-    model: process.env.ISIDORE_MODEL || null,
+    model,
+    models,
     workerScript: process.env.ISIDORE_WORKER_SCRIPT ?? join(import.meta.dirname, workerFile),
     workerBin: process.env.ISIDORE_WORKER_BIN ?? process.execPath,
     piMode: process.env.ISIDORE_PI_MODE === "json" ? "json" : "print",

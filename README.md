@@ -67,7 +67,7 @@ Compose reads these from the environment (or a `.env` file beside
 | `PI_UID` / `PI_GID` | `1000` / `1000` | uid/gid the services run as |
 | `PI_VERSION` | `latest` | `@earendil-works/pi-coding-agent` version baked into the images |
 | `PI_WEB_PACKAGE` | `pi-web-access` | Pi npm package pre-installed into the images |
-| `PI_SANDBOX_MODEL` | none | default model for spawned tasks (`provider/model`) |
+| `PI_SANDBOX_MODEL` | built-in default | default model override; must be in the built-in whitelist (`isidore/src/models.ts`) |
 | `ISIDORE_STATE` | `~/.local/state/pi-sandbox/isidore` | tasks, workspaces, shared Pi config |
 | `SCHEDULER_STATE` | `~/.local/state/pi-sandbox/scheduler` | `schedules.json` |
 | `ISIDORE_PORT` | `8920` | host port for the web UI (bound to loopback) |
