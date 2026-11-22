@@ -1,0 +1,68 @@
+name: tests
+
+on:
+  # Only the default branch on push; PR branches are covered by pull_request
+  # (otherwise a push to an open PR's branch runs the workflow twice).
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  isidore:
+    name: isidore (Node, Debian trixie)
+    # Debian trixie userland, matching the isidore image. The kernel (and thus
+    # the Landlock ABI exercised by the sandbox tests) is still the runner's.
+    runs-on: ubuntu-24.04
+    container: node:24-trixie
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: isidore
+    env:
+      # Keep the Pi SDK from phoning home during tests.
+      PI_TELEMETRY: "0"
+      PI_SKIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      # node:24-trixie is buildpack-deps based, so gcc/make/libc6-dev (and
+      # linux-libc-dev) are already present for the Landlock launcher build.
+      - name: Install dependencies
+        run: npm ci
+
+      # `npm test` runs `pretest` first, which builds the Landlock launcher
+      # (make -C sandbox), then the node:test suites.
+      - name: Run tests
+        run: npm test
+
+  scheduler:
+    name: scheduler (Python, Debian trixie)
+    runs-on: ubuntu-24.04
+    container: python:3.12-trixie
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: scheduler
+    env:
+      # Use the container's Python 3.12 instead of downloading a managed one.
+      UV_PYTHON_DOWNLOADS: "never"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run tests
+        run: uv run --frozen python -m unittest discover -s tests -v
