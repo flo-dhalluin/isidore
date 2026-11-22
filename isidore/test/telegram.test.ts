@@ -19,8 +19,16 @@ async function fakeApi(): Promise<{ server: Server; base: string; calls: Call[] 
     request.on("data", (chunk) => (raw += chunk));
     request.on("end", () => {
       const method = (request.url ?? "").split("?")[0].split("/").pop() ?? "";
-      calls.push({ method, body: raw ? JSON.parse(raw) : null });
-      const result = method === "getUpdates" ? [] : true;
+      let body: any = null;
+      if (raw) {
+        try {
+          body = JSON.parse(raw);
+        } catch {
+          body = raw; // multipart form (sendPhoto)
+        }
+      }
+      calls.push({ method, body });
+      const result = method === "getUpdates" ? [] : method === "sendPhoto" ? { photo: [{ file_id: "logo-file" }] } : true;
       setTimeout(() => response.end(JSON.stringify({ ok: true, result })), method === "getUpdates" ? 20 : 0);
     });
   });
@@ -185,12 +193,87 @@ test("notify posts each finished task once, only to allowed chats", async () => 
     await bot.notify(task);
     await bot.notify(task);
     assert.equal(sent().length, 2); // one result, split in two parts
+    assert.equal(sent()[0].body.parse_mode, "HTML");
     assert.match(sent()[0].body.text, /\[schedule s_1\]/);
     assert.match(sent()[1].body.text, new RegExp(`^${task.id} \\(2/2\\)`));
 
     const foreign = finish(store, createTask("q", { origin: "telegram:666" }));
     await bot.notify(foreign);
     assert.equal(sent().length, 2);
+  });
+});
+
+test("/start sends the logo with the formatted help caption", async () => {
+  await withBot(async ({ bot, api, secret }) => {
+    const photos = () => api.calls.filter((c) => c.method === "sendPhoto");
+    bot.handleWebhook(secret, message("/start"));
+    await until(() => photos().length === 1);
+    const form = String(photos()[0].body);
+    assert.match(form, /name="caption"/);
+    assert.match(form, /isidore - spawn isolated Pi tasks/);
+    assert.match(form, /name="parse_mode"\r\n\r\nHTML/);
+    assert.match(form, /filename="loutre-tete\.png"/);
+    assert.ok(!api.calls.some((c) => c.method === "sendMessage"));
+
+    // The uploaded logo's file_id is reused instead of uploading it again.
+    bot.handleWebhook(secret, message("/start"));
+    await until(() => photos().length === 2);
+    const second = String(photos()[1].body);
+    assert.match(second, /logo-file/);
+    assert.doesNotMatch(second, /filename="loutre-tete\.png"/);
+  });
+});
+
+test("task output is rendered with Telegram HTML formatting", async () => {
+  await withBot(async ({ bot, store, api }) => {
+    const sent = () => api.calls.filter((c) => c.method === "sendMessage");
+    const output = [
+      "# Report",
+      "",
+      "Some **bold** and _italic_ and ~~gone~~ text with [a link](https://example.com/a?b=1&c=2).",
+      "",
+      "`inline <code>` stays escaped.",
+      "",
+      "```ts",
+      "const x = a < b && b > c;",
+      "```",
+      "",
+      "> quoted",
+      "",
+      "- first",
+    ].join("\n");
+    const task = finish(store, createTask("markdown", { origin: "telegram:42" }), output);
+    store.add(task);
+    await bot.notify(task);
+    await until(() => sent().length === 1);
+    const body = sent()[0].body;
+    assert.equal(body.parse_mode, "HTML");
+    assert.match(body.text, /<b>Report<\/b>/);
+    assert.match(body.text, /<b>bold<\/b>/);
+    assert.match(body.text, /<i>italic<\/i>/);
+    assert.match(body.text, /<s>gone<\/s>/);
+    assert.match(body.text, /<a href="https:\/\/example\.com\/a\?b=1&amp;c=2">a link<\/a>/);
+    assert.match(body.text, /<code>inline &lt;code&gt;<\/code>/);
+    assert.match(body.text, /<pre><code class="language-ts">\nconst x = a &lt; b &amp;&amp; b &gt; c;\n<\/code><\/pre>/);
+    assert.match(body.text, /<blockquote>quoted<\/blockquote>/);
+    assert.match(body.text, /• first/);
+  });
+});
+
+test("a long fenced code block splits into balanced code messages", async () => {
+  await withBot(async ({ bot, store, api }) => {
+    const sent = () => api.calls.filter((c) => c.method === "sendMessage");
+    const output = ["```ts", ...Array(2_000).fill("let x = 1;"), "```"].join("\n");
+    const task = finish(store, createTask("code", { origin: "telegram:42" }), output);
+    store.add(task);
+    await bot.notify(task);
+    const bodies = sent().map((call) => call.body.text);
+    assert.ok(bodies.length > 1, "expected the result to be split");
+    for (const text of bodies) {
+      assert.match(text, /<pre><code class="language-ts">/);
+      assert.match(text, /<\/code><\/pre>/);
+    }
+    assert.match(bodies[1], new RegExp(`^${task.id} \\(2/`));
   });
 });
 
@@ -223,12 +306,12 @@ test("/tools lists pending promotions + active globals; /approve uses the shared
     assert.ok(listing.includes(global.id));
     assert.ok(listing.includes("globaltool"));
     assert.ok(!listing.includes(conv.id));
-    assert.match(listing, /\/approve <id>/);
+    assert.match(listing, /\/approve &lt;id&gt;/);
 
     // /approve without an id shows usage; unknown ids are refused.
     bot.handleWebhook(secret, message("/approve"));
     await until(() => sent().length === 2);
-    assert.match(sent()[1].body.text, /Usage: \/approve <tool-id>/);
+    assert.match(sent()[1].body.text, /Usage: \/approve &lt;tool-id&gt;/);
     bot.handleWebhook(secret, message("/approve tl_nope"));
     await until(() => sent().length === 3);
     assert.match(sent()[2].body.text, /Not approved: unknown tool/);

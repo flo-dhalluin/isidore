@@ -1,15 +1,154 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Runner } from "./runner.ts";
 import { isDone, rootId, type Task, type TaskStore } from "./store.ts";
+import { readTemplateAsset } from "./templates.ts";
 import { approvePromotion } from "./tools-api.ts";
 import type { ToolRegistry } from "./tools.ts";
 
 const TASK_ID = /\bt_[0-9a-f]{12}\b/;
 const MAX_MESSAGE = 3_800; // Telegram's hard limit is 4096; leave room for a header.
 
-function chunks(text: string, size = MAX_MESSAGE): string[] {
+/** Escape the characters Telegram's HTML parse mode treats as markup. */
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function escapeAttribute(text: string): string {
+  return escapeHtml(text).replace(/"/g, "&quot;");
+}
+
+/** Markdown inline spans that map onto Telegram's supported HTML tags. */
+const INLINE =
+  /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(__[^_\n]+__)|(~~[^~\n]+~~)|(\|\|[^|\n]+\|\|)|(\[[^\]\n]*\]\([^()\s]+\))|((?<![\w*])\*(?!\s)[^*\n]+?(?<!\s)\*(?![\w*]))|((?<![\w_])_(?!\s)[^_\n]+?(?<!\s)_(?![\w_]))/g;
+
+function formatInline(text: string): string {
+  let out = "";
+  let last = 0;
+  for (const match of text.matchAll(INLINE)) {
+    const token = match[0];
+    out += escapeHtml(text.slice(last, match.index));
+    if (token.startsWith("`")) out += `<code>${escapeHtml(token.slice(1, -1))}</code>`;
+    else if (token.startsWith("**") || token.startsWith("__")) out += `<b>${formatInline(token.slice(2, -2))}</b>`;
+    else if (token.startsWith("~~")) out += `<s>${formatInline(token.slice(2, -2))}</s>`;
+    else if (token.startsWith("||")) out += `<span class="tg-spoiler">${formatInline(token.slice(2, -2))}</span>`;
+    else if (token.startsWith("[")) {
+      const split = token.indexOf("](");
+      out += `<a href="${escapeAttribute(token.slice(split + 2, -1))}">${formatInline(token.slice(1, split))}</a>`;
+    } else out += `<i>${formatInline(token.slice(1, -1))}</i>`;
+    last = match.index + token.length;
+  }
+  return out + escapeHtml(text.slice(last));
+}
+
+const FENCE = /^\s*(`{3,}|~{3,})(.*)$/;
+
+interface Fence {
+  /** Opening line, used to reopen the block when a chunk is split. */
+  open: string;
+  /** Closing delimiter for the HTML block. */
+  close: string;
+  char: string;
+  length: number;
+}
+
+function fenceAt(line: string): { marker: string; char: string; length: number; info: string } | null {
+  const match = FENCE.exec(line);
+  if (!match) return null;
+  return { marker: match[1], char: match[1][0], length: match[1].length, info: match[2].trim() };
+}
+
+/** Convert agent Markdown to the subset of HTML Telegram renders. */
+function formatHtml(markdown: string): string {
+  const out: string[] = [];
+  let fence: Fence | null = null;
+  for (const line of markdown.split("\n")) {
+    const marker = fenceAt(line);
+    if (fence) {
+      if (marker && marker.char === fence.char && marker.length >= fence.length) {
+        out.push(fence.close);
+        fence = null;
+      } else {
+        out.push(escapeHtml(line));
+      }
+      continue;
+    }
+    if (marker) {
+      const language = marker.info.replace(/[^\w.+-]/g, "");
+      fence = { open: line, close: language ? "</code></pre>" : "</pre>", char: marker.char, length: marker.length };
+      out.push(language ? `<pre><code class="language-${language}">` : "<pre>");
+      continue;
+    }
+    const heading = /^\s{0,3}#{1,6}\s+(.*)$/.exec(line);
+    if (heading) {
+      out.push(`<b>${formatInline(heading[1])}</b>`);
+      continue;
+    }
+    const quote = /^\s{0,3}>\s?(.*)$/.exec(line);
+    if (quote) {
+      out.push(`<blockquote>${formatInline(quote[1])}</blockquote>`);
+      continue;
+    }
+    const bullet = /^(\s*)[-*+]\s+(.*)$/.exec(line);
+    if (bullet) {
+      out.push(`${bullet[1]}• ${formatInline(bullet[2])}`);
+      continue;
+    }
+    out.push(formatInline(line));
+  }
+  if (fence) out.push(fence.close);
+  return out.join("\n");
+}
+
+/**
+ * Split Markdown into chunks below Telegram's message limit, cutting at line
+ * boundaries and closing/reopening a fenced code block when a split lands
+ * inside one, so every chunk formats cleanly on its own.
+ */
+function chunks(text: string, limit = MAX_MESSAGE): string[] {
   const result: string[] = [];
-  for (let i = 0; i < text.length; i += size) result.push(text.slice(i, i + size));
+  let current: string[] = [];
+  let length = 0;
+  let fence: Fence | null = null;
+
+  const add = (line: string): void => {
+    if (current.length) length += 1;
+    current.push(line);
+    length += line.length;
+  };
+  const flush = (): void => {
+    if (!current.length) return;
+    if (fence) {
+      current.push(fence.close);
+      length += 1 + fence.close.length;
+    }
+    result.push(current.join("\n"));
+    // Reopen the fence in the next chunk, unless its opening line alone is too long.
+    const reopen = fence !== null && fence.open.length + 2 < limit;
+    current = reopen ? [fence!.open] : [];
+    length = current.length ? current[0].length : 0;
+    if (!reopen) fence = null;
+  };
+
+  for (const line of text.split("\n")) {
+    const marker = fenceAt(line);
+    const closing = !!(fence && marker && marker.char === fence.char && marker.length >= fence.length);
+    let content = line;
+    for (;;) {
+      const capacity = limit - length - (current.length ? 1 : 0);
+      if (content.length <= capacity) {
+        add(content);
+        break;
+      }
+      if (capacity > 0) {
+        add(content.slice(0, capacity));
+        content = content.slice(capacity);
+      }
+      flush();
+    }
+    if (closing) fence = null;
+    else if (!fence && marker) fence = { open: line.replace(/^\s+/, ""), close: marker.marker, char: marker.char, length: marker.length };
+  }
+  flush();
   return result.length ? result : [""];
 }
 
@@ -48,6 +187,8 @@ export class TelegramBot {
   private readonly botId: string;
   /** Tasks whose final state was already posted (cancel reports twice). */
   private readonly notified = new Set<string>();
+  /** Telegram file_id of the logo, so it is uploaded only once per process. */
+  private logoFileId: string | null = null;
   private offset = 0;
   private stopped = false;
 
@@ -150,20 +291,66 @@ export class TelegramBot {
     return updates;
   }
 
-  /** Send `text`, split into several messages; `tag` prefixes every part after the first. */
+  /**
+   * Send `text`, split into several messages; `tag` prefixes every part after
+   * the first. Task output is Markdown, rendered with Telegram's HTML parse
+   * mode; if Telegram rejects the markup, the plain text is sent instead.
+   */
   async send(chatId: string | number, text: string, tag?: string): Promise<void> {
     const parts = chunks(text);
     for (const [index, part] of parts.entries()) {
-      const chunk = tag && index > 0 ? `${tag} (${index + 1}/${parts.length})\n${part}` : part;
-      try {
-        await fetch(`${this.apiBase}/bot${this.token}/sendMessage`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ chat_id: chatId, text: chunk, disable_web_page_preview: true }),
-        });
-      } catch {
-        return;
+      const header = tag && index > 0 ? `${tag} (${index + 1}/${parts.length})\n` : "";
+      if (!(await this.post(chatId, header + formatHtml(part), "HTML"))) {
+        if (!(await this.post(chatId, header + part))) return;
       }
+    }
+  }
+
+  /** Send the bot logo with an HTML caption; false when Telegram rejects it. */
+  private async sendLogo(chatId: string | number, caption: string): Promise<boolean> {
+    try {
+      const form = new FormData();
+      form.append("chat_id", String(chatId));
+      form.append("caption", caption);
+      form.append("parse_mode", "HTML");
+      if (this.logoFileId) {
+        form.append("photo", this.logoFileId);
+      } else {
+        const source = readTemplateAsset("loutre-tete.png");
+        const png = new Uint8Array(source.length);
+        png.set(source);
+        form.append("photo", new Blob([png], { type: "image/png" }), "loutre-tete.png");
+      }
+      const response = await fetch(`${this.apiBase}/bot${this.token}/sendPhoto`, { method: "POST", body: form });
+      const data = (await response.json().catch(() => ({}))) as {
+        ok?: boolean;
+        result?: { photo?: Array<{ file_id?: string }> };
+      };
+      if (!response.ok || data.ok === false) return false;
+      const photos = data.result?.photo ?? [];
+      this.logoFileId = photos[photos.length - 1]?.file_id ?? null;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async post(chatId: string | number, text: string, parseMode?: string): Promise<boolean> {
+    try {
+      const response = await fetch(`${this.apiBase}/bot${this.token}/sendMessage`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text,
+          disable_web_page_preview: true,
+          ...(parseMode ? { parse_mode: parseMode } : {}),
+        }),
+      });
+      const data = (await response.json().catch(() => ({}))) as { ok?: boolean };
+      return response.ok && data.ok !== false;
+    } catch {
+      return false;
     }
   }
 
@@ -191,7 +378,10 @@ export class TelegramBot {
       }
     }
 
-    if (command === "/start" || command === "/help") await this.send(chatId, this.help());
+    if (command === "/start") {
+      // Brand the first contact with the logo; fall back to the plain help text.
+      if (!(await this.sendLogo(chatId, formatHtml(this.help())))) await this.send(chatId, this.help());
+    } else if (command === "/help") await this.send(chatId, this.help());
     else if (command === "/new") {
       if (!rest) await this.send(chatId, "Usage: /new <prompt>");
       else await this.create(chatId, rest);

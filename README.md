@@ -137,7 +137,10 @@ no public URL or open port. A [webhook](#webhook-optional) is optional.
 
 1. **Create the bot**: in Telegram, talk to [@BotFather](https://t.me/BotFather),
    send `/newbot`, pick a name and username, and copy the token
-   (`123456789:AA...`).
+   (`123456789:AA...`). Then send BotFather `/setuserpic`, pick the bot, and
+   upload [`loutre-tete.png`](loutre-tete.png) (isidore also serves it at
+   `/loutre-tete.png`). The Bot API cannot change a bot's profile photo, so
+   this one-time BotFather step is the only way to set the logo as its avatar.
 2. **Find your chat id**: send your bot any message (for a group, add the bot to
    the group and post in it first), then, *before* isidore starts polling with
    that token (polling consumes the updates):
@@ -163,7 +166,8 @@ no public URL or open port. A [webhook](#webhook-optional) is optional.
    then `docker compose up -d` to recreate the container.
    `curl localhost:8920/api/info` (plus `-H "Authorization: Bearer $ISIDORE_TOKEN"`
    if set) should report `"telegram": true, "telegram_mode": "polling"`.
-4. **Use it**: send plain text or `/new <prompt>` to queue a task; `/list`,
+4. **Use it**: send plain text or `/new <prompt>` to queue a task; `/start`
+   replies with the bot logo; `/list`,
    `/status <id>`, `/cancel <id>`, `/tools`, `/approve <id>`, `/help`. The
    originating chat gets the task's
    output when it finishes (split into several messages if long).
@@ -178,7 +182,9 @@ Notes:
 - Messages from chats not in `ISIDORE_TELEGRAM_CHATS` are silently ignored; an
   empty list disables everyone. Results are only ever posted to allowed chats.
 - Only final results are posted, not progress or tool calls; the web UI shows
-  those.
+  those. Replies are rendered with Telegram's HTML formatting (bold, italic,
+  strikethrough, links, inline code, code blocks, quotes, spoilers) and fall
+  back to plain text if Telegram rejects the markup.
 - Every allowed chat sees and can cancel **all** tasks (`/list`, `/status` are
   not scoped per chat), including ones started from the web UI.
 - In polling mode isidore deletes any webhook left on the bot at startup;
