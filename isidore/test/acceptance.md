@@ -277,3 +277,21 @@ A follow-up ("call greeter again") still sees it; conversation B's
 at="+1m")`: the fired child runs in its OWN workspace with the pinned
 tool, and a tool the child creates is absent from A's `tool_list`.
 
+## 11. Files (`send_file`)
+
+Automated: `test/files-mcp.test.ts` (protocol, copy, download, conversation
+scoping, workspace confinement, oversized files, delete cascade).
+
+Manual smoke:
+
+```
+Conversation A prompt:
+  Write a short report to report.md, then call send_file for it.
+```
+
+Expected: the turn in the task view shows a `report.md` download link; the
+admin token fetches the bytes from
+`GET /api/tasks/<A-id>/artifacts/<artifactId>`. Conversation B's task token
+gets 404 for that artifact. `send_file(path="/state/shared/admin-token")` is
+refused (outside the workspace).
+

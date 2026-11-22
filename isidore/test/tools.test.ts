@@ -248,7 +248,7 @@ test("name collisions with builtins, reserved names and the same owner are rejec
   const dir = tempDir();
   try {
     const registry = new ToolRegistry(dir, {});
-    for (const name of ["browser", "scheduler", "tools", "bash", "read", "edit", "write", "find", "grep", "ls", "codemode", "tool_search", "mcp"]) {
+    for (const name of ["browser", "scheduler", "tools", "files", "bash", "read", "edit", "write", "find", "grep", "ls", "codemode", "tool_search", "mcp"]) {
       assert.throws(() => registry.create(commandInput(name), convOwner("t_a")), /reserved/);
     }
     registry.create(commandInput("dup"), convOwner("t_a"));

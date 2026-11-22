@@ -126,7 +126,7 @@ export const RESERVED_TOOL_NAMES: ReadonlySet<string> = new Set([
 ]);
 
 /** Builtin names are reserved even when the corresponding URL is unset. */
-const BUILTIN_NAMES: ReadonlySet<string> = new Set(["browser", "scheduler", "tools", "codemode", "tool_search", "mcp"]);
+const BUILTIN_NAMES: ReadonlySet<string> = new Set(["browser", "scheduler", "tools", "files", "codemode", "tool_search", "mcp"]);
 
 const NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
 const TOOL_KINDS: ReadonlySet<string> = new Set(["mcp", "command", "extension"]);
@@ -377,6 +377,8 @@ const BROWSER_DESCRIPTION = "Headless Firefox: open pages, read and interact wit
 const SCHEDULER_DESCRIPTION = "Schedule one-shot or recurring tasks that spawn isolated Pi agents";
 const TOOLS_DESCRIPTION =
   "Author and manage this conversation's tools: tool_create, tool_list, tool_get, tool_update, tool_disable, tool_remove, tool_request_promotion. New command/mcp tools are live in the same turn";
+const FILES_DESCRIPTION =
+  "Send files from this task's workspace to the user: send_file copies a file and adds a download link to the task view";
 
 function builtinProvenance(): ToolManifest["provenance"] {
   return { task_id: null, root_id: null, origin: "builtin", created_at: utcnow(), sha256: "" };
@@ -389,7 +391,9 @@ function builtinProvenance(): ToolManifest["provenance"] {
  * from the worker env), browser without auth headers. Entries vanish when the
  * corresponding PI_SANDBOX_*_URL is unset. builtin:tools (Phase 3) uses
  * ISIDORE_TOOLS_URL when set, else http://127.0.0.1:<port>/mcp/tools when a
- * port is given; with neither it is omitted (bare dev/test environments).
+ * port is given; builtin:files uses ISIDORE_FILES_URL, else the same host at
+ * /mcp/files. With neither URL nor port those entries are omitted (bare
+ * dev/test environments).
  * The codemode/tool_search/mcp entries are informational — the worker already
  * loads those extensions through the SDK factories.
  */
@@ -437,6 +441,21 @@ export function builtinManifests(env: NodeJS.ProcessEnv, port?: number): ToolMan
       status: "active",
       mcp: { url: toolsUrl, headers, exposure: "direct", timeout: 30 },
       provenance: { ...builtinProvenance(), sha256: sha256(canonicalJson({ url: toolsUrl, headers })) },
+    });
+  }
+  const filesUrl = env.ISIDORE_FILES_URL || (port !== undefined ? `http://127.0.0.1:${port}/mcp/files` : undefined);
+  if (filesUrl) {
+    const headers = { Authorization: "Bearer ${ISIDORE_TASK_TOKEN}" };
+    manifests.push({
+      id: "builtin:files",
+      name: "files",
+      version: 1,
+      kind: "mcp",
+      description: FILES_DESCRIPTION,
+      scope: "global",
+      status: "active",
+      mcp: { url: filesUrl, headers, exposure: "direct", timeout: 30 },
+      provenance: { ...builtinProvenance(), sha256: sha256(canonicalJson({ url: filesUrl, headers })) },
     });
   }
   const extensions: Array<[string, string]> = [

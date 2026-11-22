@@ -47,8 +47,10 @@ under their root task; clicking a task opens a full-screen conversation page
 where you can read the transcript, cancel a running turn, ask follow-up
 questions, or delete a finished conversation (records **and** workspace). Each
 task shows the tools the agent called (name, arguments and outcome) in a
-collapsible accordion, and a spinner marks a queued or running task while it
-waits to finish. Agent answers are rendered as HTML by a small, dependency-free
+collapsible accordion; a spinner marks a queued or running task while it
+waits to finish; and files published with `send_file` appear as download
+links on the turn that produced them. Agent answers are rendered as HTML by a
+small, dependency-free
 Markdown renderer in the page (headings, lists, code blocks, tables, links);
 the source is HTML-escaped first and unsafe URL schemes are refused, so agent
 output cannot inject markup.
@@ -62,6 +64,7 @@ REST API:
 | `GET` | `/api/tasks?limit=50&status=running` | list tasks |
 | `POST` | `/api/tasks` | `{prompt, model?, origin?, schedule_id?}` → 202 (model must be whitelisted) |
 | `GET` | `/api/tasks/{id}` | one task, including output |
+| `GET` | `/api/tasks/{id}/artifacts/{artifactId}` | download a file published with `send_file` |
 | `DELETE` | `/api/tasks/{id}` | delete a finished conversation + workspace |
 | `GET` | `/api/tasks/{id}/thread` | every turn of a conversation, oldest first |
 | `POST` | `/api/tasks/{id}/followup` | `{prompt, model?}` → 202, continues the conversation |
@@ -114,11 +117,12 @@ The compose port is loopback-only; use a reverse proxy for remote access.
 ## Tool registry
 
 Each spawn is composed from a service-owned registry (`src/tools.ts`):
-builtin manifests (browser, scheduler, the `tools` authoring MCP, plus
-informational extension entries), the conversation's own active tools, any
-human-approved active globals, and — for lineage children (`conversation_id`
-on `POST /api/tasks`) — the parent conversation's tools pinned to the version
-current at spawn. Workers never touch the registry itself.
+builtin manifests (browser, scheduler, the `tools` authoring MCP, the `files`
+MCP, plus informational extension entries), the conversation's own active
+tools, any human-approved active globals, and — for lineage children
+(`conversation_id` on `POST /api/tasks`) — the parent conversation's tools
+pinned to the version current at spawn. Workers never touch the registry
+itself.
 
 Storage (service-only; the sandbox denies `/state/tools` to workers):
 
@@ -144,6 +148,30 @@ immediately (no approval needed — a human is the author).
 Visibility is per conversation: a task sees and mutates only its own tools
 (plus active globals, read-only). New tools default to `conversation` scope;
 `scope: "global"` from an agent always lands in `pending_approval`.
+
+### Files (`send_file`)
+
+Every task also gets the `files` builtin MCP (`POST /mcp/files`, Bearer task
+token). Its single tool, `send_file`, copies a file from the task's workspace
+into the service-only artifact store and records it on the current turn, so
+the task view shows a download link:
+
+```json
+{"path": "report.md", "name": "report.md", "description": "quarterly report"}
+```
+
+`path` may be relative to the workspace (its cwd) or absolute, but it must
+resolve inside the workspace; symlinks are resolved and refused if they
+escape. `name` and `description` are optional. The agent can call the tool
+once per file; each call returns the recorded artifact id.
+
+Artifacts live under `<stateDir>/artifacts/<root>/<artifactId>` (never mounted
+into the worker) and are deleted with the conversation. Downloads go through
+`GET /api/tasks/{id}/artifacts/{artifactId}` with the admin token (or a task
+token scoped to that conversation) and are always
+`Content-Disposition: attachment` with `X-Content-Type-Options: nosniff`, so
+agent-authored HTML/SVG cannot execute in the UI's origin. Limits: 50 MB per
+file, 32 files per turn.
 
 ### Promotion (human-gated)
 
@@ -184,7 +212,7 @@ approve/reject/disable/enable/rollback/delete actions. The API behind it is
 | `DELETE` | `/api/tools/{id}` | remove records + every cache copy across roots |
 
 Deleting a conversation (`DELETE /api/tasks/{id}`) also deletes its scoped
-tools and their cache copies.
+tools, their cache copies, and its published artifacts.
 
 ### Limits
 
@@ -253,6 +281,8 @@ their results go back to the chat.
 | `ISIDORE_SCHEDULER_URL` | none | enables the schedule form |
 | `ISIDORE_SCHEDULER_TOKEN` | none | bearer token for the scheduler; when unset, read per-request from `ISIDORE_SCHEDULER_TOKEN_FILE` |
 | `ISIDORE_SCHEDULER_TOKEN_FILE` | `/state/scheduler-shared/scheduler-token` | file holding the scheduler admin token (compose: `scheduler-auth` volume; the scheduler generates it at startup when `SCHEDULER_TOKEN` is unset) |
+| `ISIDORE_TOOLS_URL` | `http://127.0.0.1:<port>/mcp/tools` | override the builtin tools authoring MCP URL |
+| `ISIDORE_FILES_URL` | `http://127.0.0.1:<port>/mcp/files` | override the builtin files MCP URL |
 | `ISIDORE_TELEGRAM_TOKEN` | none | bot token; enables the bot |
 | `ISIDORE_TELEGRAM_TOKEN_FILE` | none | file holding the token, used when `ISIDORE_TELEGRAM_TOKEN` is unset |
 | `ISIDORE_TELEGRAM_CHATS` | empty | allowed chat ids |

@@ -256,8 +256,8 @@ Smoke test: `docker compose exec -T browser python - < pilot.py`.
 ## Tool registry
 
 Every spawned task is composed from a service-owned tool registry: the
-builtins (browser, scheduler, the `tools` authoring MCP) plus the
-conversation's own tools and any human-approved global tools. Agents author
+builtins (browser, scheduler, the `tools` authoring MCP, the `files` MCP) plus
+the conversation's own tools and any human-approved global tools. Agents author
 `mcp` and `command` tools through the `tools` MCP — `tool_create`,
 `tool_list`, `tool_get`, `tool_update`, `tool_disable`, `tool_remove`,
 `tool_request_promotion` — and can use them in the same turn. `extension`
@@ -292,6 +292,19 @@ API: `POST /api/tools` (human authoring, incl. extensions),
 Limits: 32 tools per conversation, 16 KB per manifest, 64 KB of source per
 version, command tools capped at 120 s per call (30 s default) with output
 truncated at 4000 characters per stream.
+
+## Files
+
+The `files` builtin MCP gives every task one tool, `send_file`. When the agent
+produces a report, dataset, image or archive, it calls
+`send_file(path="report.md", name="report.md", description="…")`; isidore
+copies the file out of the workspace into `<stateDir>/artifacts/<root>/` and
+adds a download link to that turn in the task view. Paths are confined to the
+task's workspace (symlink escapes are refused), and the download route
+(`GET /api/tasks/{id}/artifacts/{artifactId}`) always serves an attachment
+with `nosniff`, so agent-authored HTML/SVG cannot run in the UI's origin.
+Limits: 50 MB per file, 32 files per turn; deleting the conversation deletes
+its artifacts.
 
 Residual risks (unchanged from the isolation model): all tasks share one uid
 and Landlock ABI 4 does not scope signals, so a task can `kill` another

@@ -74,11 +74,15 @@ test("serves the UI, API and runs a task end to end", async () => {
     assert.match(index.body, /id="model-input"/);
     // The index links to the tool registry page (token propagated client-side).
     assert.match(index.body, /id="tools-link" href="\/tools"/);
+    // Artifacts published with send_file are surfaced in the task list.
+    assert.match(index.body, /fileCount/);
 
     const taskPage = await app.inject({ method: "GET", url: "/tasks/t_abc", headers: adminAuth });
     assert.equal(taskPage.statusCode, 200);
     assert.match(taskPage.body, /id="ask"/);
     assert.match(taskPage.body, /id="model-select"/);
+    // The task page renders the download links for published artifacts.
+    assert.match(taskPage.body, /artifactList/);
 
     const toolsPage = await app.inject({ method: "GET", url: "/tools", headers: adminAuth });
     assert.equal(toolsPage.statusCode, 200);
@@ -159,6 +163,7 @@ test("no token => 401 on every authenticated surface", async () => {
     for (const [method, url] of [
       ["GET", "/api/info"],
       ["GET", "/api/tasks"],
+      ["GET", "/api/tasks/t_x/artifacts/a_x"],
       ["POST", "/api/tasks"],
       ["GET", "/api/auth/whoami"],
       ["GET", "/"],

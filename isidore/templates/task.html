@@ -41,6 +41,14 @@
   .tool .tool-args { flex: 1 1 auto; color: var(--muted); overflow: hidden; text-overflow: ellipsis;
                      white-space: nowrap; background: none; padding: 0; }
   .tool .tool-meta { flex: 0 0 auto; color: var(--muted); font-size: .72rem; }
+  .artifacts { margin-top: .9rem; }
+  .artifact-rows { display: grid; gap: .3rem; margin-top: .4rem; }
+  .artifact { display: flex; gap: .6rem; align-items: baseline; padding: .45rem .6rem;
+              border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 3px; }
+  .artifact:hover { text-decoration: none; background: rgba(127,127,127,.08); }
+  .artifact-name { font-weight: 600; }
+  .artifact-name::before { content: "\2193"; display: inline-block; margin-right: .4em; color: var(--accent); }
+  .artifact-meta { color: var(--muted); font-size: .78rem; }
   pre { margin: .6rem 0 0; padding: .6rem; background: rgba(127,127,127,.08); overflow: auto;
         white-space: pre-wrap; word-break: break-word; font-size: .85rem; }
   .foot { display: flex; gap: .6rem; align-items: baseline; flex-wrap: wrap; margin-top: .5rem; }
@@ -152,19 +160,45 @@ function toolList(task) {
   </details>`;
 }
 
+function fmtBytes(bytes) {
+  if (bytes === null || bytes === undefined || isNaN(Number(bytes))) return "";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = Number(bytes);
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return (unit === 0 ? value : value.toFixed(value < 10 ? 1 : 0)) + " " + units[unit];
+}
+
+/** Files the agent published with send_file, linked to the download route. */
+function artifactList(task) {
+  const artifacts = Array.isArray(task.artifacts) ? task.artifacts : [];
+  if (!artifacts.length) return "";
+  const query = TOKEN ? "?token=" + encodeURIComponent(TOKEN) : "";
+  return `<div class="artifacts">
+    <span class="who">files</span>
+    <div class="artifact-rows">${artifacts.map((a) => `
+      <a class="artifact" href="/api/tasks/${encodeURIComponent(task.id)}/artifacts/${encodeURIComponent(a.id)}${query}" download="${esc(a.name)}">
+        <span class="artifact-name">${esc(a.name)}</span>
+        <span class="artifact-meta">${esc(fmtBytes(a.size))}${a.description ? " · " + esc(a.description) : ""}</span>
+      </a>`).join("")}</div>
+  </div>`;
+}
+
 function turn(task) {
   const hasTools = task.tool_calls && task.tool_calls.length;
+  const hasArtifacts = Array.isArray(task.artifacts) && task.artifacts.length;
   return `
     <article class="turn">
       <section class="ask">
         <span class="who">you</span>
         <p class="prompt">${esc(task.prompt)}</p>
       </section>
-      ${task.output || task.error || hasTools ? `<section class="answer">
+      ${task.output || task.error || hasTools || hasArtifacts ? `<section class="answer">
         <span class="who">agent</span>
         ${toolList(task)}
         ${task.output ? `<div class="md">${mdToHtml(task.output)}</div>` : ""}
         ${task.error ? `<pre class="err">${esc(task.error)}</pre>` : ""}
+        ${artifactList(task)}
       </section>` : ""}
       <div class="foot">
         <span class="status ${esc(task.status)}">${spinner(task.status)}${esc(task.status)}</span>
@@ -190,7 +224,8 @@ function render(data) {
     : "answers keep this conversation's workspace and session";
   // Re-render only when something changed, so reading/scrolling is not disturbed.
   const sig = data.turns.map((t) => [t.id, t.status, t.output.length, t.error || "",
-    (t.tool_calls || []).map((c) => c.name + c.status).join(",")].join(":")).join("|");
+    (t.tool_calls || []).map((c) => c.name + c.status).join(","),
+    (t.artifacts || []).map((a) => a.id).join(",")].join(":")).join("|");
   if (sig === lastSig) return;
   const main = document.querySelector("main");
   const atBottom = main.scrollHeight - main.scrollTop - main.clientHeight < 80;

@@ -1,8 +1,9 @@
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
-import { rmSync } from "node:fs";
+import { createReadStream, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { artifactPath, contentDisposition, removeConversationArtifacts } from "./artifacts.ts";
 import { deny, resolveAuth } from "./auth.ts";
-import { generateAdminToken, tasksDir, toolCacheDir, toolsDir, workspacesDir, writeAdminToken, type Settings } from "./config.ts";
+import { artifactsDir, generateAdminToken, tasksDir, toolCacheDir, toolsDir, workspacesDir, writeAdminToken, type Settings } from "./config.ts";
 import { Runner } from "./runner.ts";
 import { SchedulerClient } from "./scheduler.ts";
 import { TelegramBot } from "./telegram.ts";
@@ -13,6 +14,7 @@ import { ToolRegistry } from "./tools.ts";
 import { removeToolCacheCopies } from "./tool-cache.ts";
 import { registerToolsApi } from "./tools-api.ts";
 import { registerToolsMcp } from "./tools-mcp.ts";
+import { registerFilesMcp } from "./files-mcp.ts";
 
 const MAX_PROMPT = 100_000;
 
@@ -75,6 +77,16 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
   // Tools authoring MCP (Phase 3): stateless streamable-HTTP JSON-RPC, scoped
   // to the caller's conversation via the same resolveAuth as the REST API.
   registerToolsMcp(app, { registry, tokens, adminToken, toolCacheRoot });
+
+  // Files MCP: send_file copies a workspace file into the service-only
+  // artifact store and attaches a download link to the calling task.
+  registerFilesMcp(app, {
+    store,
+    tokens,
+    adminToken,
+    workspaceRoot: workspacesDir(settings),
+    artifactsRoot: artifactsDir(settings),
+  });
 
   // Human admin surface (Phase 4): /api/tools is ADMIN-ONLY (task tokens get
   // 401). Approval here is the only path that makes a tool active+global.
@@ -198,6 +210,36 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
     return publicTask(task);
   });
 
+  // Download one artifact published with send_file. Auth is the same as the
+  // rest of the API; the task token scope keeps conversations isolated. The
+  // response is always an attachment with nosniff, so agent-authored HTML/SVG
+  // can never execute in the UI's origin.
+  app.get("/api/tasks/:taskId/artifacts/:artifactId", async (request, reply) => {
+    const auth = resolveAuth(request, adminToken, tokens);
+    if (!auth) return deny(reply);
+    const { taskId, artifactId } = request.params as { taskId: string; artifactId: string };
+    const task = store.get(taskId);
+    if (!task) return notFound(reply);
+    if (auth.kind === "task" && rootId(task) !== auth.scope.rootId) return notFound(reply);
+    const artifacts = Array.isArray(task.artifacts) ? task.artifacts : [];
+    const artifact = artifacts.find((entry) => entry.id === artifactId);
+    if (!artifact) return notFound(reply);
+    const path = artifactPath(artifactsDir(settings), rootId(task), artifact.id);
+    let size: number;
+    try {
+      size = statSync(path).size;
+    } catch {
+      return notFound(reply);
+    }
+    return reply
+      .header("Content-Type", artifact.content_type || "application/octet-stream")
+      .header("Content-Length", String(size))
+      .header("Content-Disposition", contentDisposition(artifact.name))
+      .header("X-Content-Type-Options", "nosniff")
+      .header("Cache-Control", "private, max-age=3600")
+      .send(createReadStream(path));
+  });
+
   app.delete("/api/tasks/:taskId", async (request, reply) => {
     const auth = resolveAuth(request, adminToken, tokens);
     if (!auth) return deny(reply);
@@ -211,6 +253,11 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
     const root = rootId(task);
     for (const turn of turns) store.remove(turn.id);
     rmSync(join(workspacesDir(settings), root), { recursive: true, force: true });
+    try {
+      removeConversationArtifacts(artifactsDir(settings), root);
+    } catch (error) {
+      console.error(`isidore: artifact cleanup for ${root} failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
     // Cascade the conversation's tools: registry records (indexes + version
     // dirs) and its read-only tool-cache copies. Children may hold PINNED
     // cache copies of this conversation's tools under their own roots, so

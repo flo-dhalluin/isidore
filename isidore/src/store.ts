@@ -14,6 +14,19 @@ export interface ToolCall {
   duration_ms?: number;
 }
 
+/** A file the agent published from its workspace for the user to download. */
+export interface Artifact {
+  /** "a_"+12hex; also the filename in the service-only artifact store. */
+  id: string;
+  /** Suggested download filename (sanitized). */
+  name: string;
+  /** Optional one-line note shown next to the link. */
+  description: string | null;
+  size: number;
+  content_type: string;
+  created_at: string;
+}
+
 export const TERMINAL_STATUSES: ReadonlySet<Status> = new Set([
   "succeeded",
   "failed",
@@ -47,6 +60,8 @@ export interface Task {
   inherited_tools: Array<{ id: string; version: number }> | null;
   workspace: string | null;
   tool_calls: ToolCall[];
+  /** Files published with the files MCP (send_file), newest last. */
+  artifacts: Artifact[];
 }
 
 export type PublicTask = Task & { done: boolean };
@@ -95,6 +110,7 @@ export function createTask(prompt: string, overrides: Partial<Task> = {}): Task 
     inherited_tools: null,
     workspace: null,
     tool_calls: [],
+    artifacts: [],
     ...overrides,
   };
 }
@@ -118,6 +134,7 @@ const KNOWN_FIELDS: ReadonlySet<string> = new Set([
   "inherited_tools",
   "workspace",
   "tool_calls",
+  "artifacts",
 ]);
 
 function fromDict(data: Record<string, unknown>): Task {
@@ -126,6 +143,10 @@ function fromDict(data: Record<string, unknown>): Task {
   for (const key of KNOWN_FIELDS) {
     if (key in data) target[key] = data[key];
   }
+  // Tolerate a hand-edited/corrupt record without letting it break the API or
+  // the artifact writer (both assume an array).
+  if (!Array.isArray(task.artifacts)) task.artifacts = [];
+  if (!Array.isArray(task.tool_calls)) task.tool_calls = [];
   return task;
 }
 

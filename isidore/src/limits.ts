@@ -24,3 +24,9 @@ export const MAX_COMMAND_TIMEOUT_S = 120;
 
 /** Timeout applied to command tools that do not specify one, in seconds. */
 export const DEFAULT_COMMAND_TIMEOUT_S = 30;
+
+/** Maximum size of a file an agent may publish to the task view, in bytes. */
+export const MAX_ARTIFACT_BYTES = 50 * 1024 * 1024;
+
+/** Maximum files one task turn may publish to the task view. */
+export const MAX_ARTIFACTS_PER_TASK = 32;
