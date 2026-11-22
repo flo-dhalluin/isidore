@@ -276,6 +276,14 @@ $("run").onsubmit = async (ev) => {
   finally { button.disabled = false; }
 };
 
+// Ctrl+Enter (Cmd+Enter on macOS) submits; plain Enter still inserts a newline.
+$("prompt").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
+    ev.preventDefault();
+    $("run").requestSubmit();
+  }
+});
+
 (async () => {
   try {
     const info = await api("/api/info");

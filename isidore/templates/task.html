@@ -187,7 +187,7 @@ function render(data) {
   $("send").disabled = running;
   $("hint").innerHTML = running
     ? '<span class="spinner" aria-hidden="true"></span>waiting for the current turn to finish…'
-    : "answers keep this conversation's workspace and session";
+    : "answers keep this conversation's workspace and session · Ctrl+Enter to send";
   // Re-render only when something changed, so reading/scrolling is not disturbed.
   const sig = data.turns.map((t) => [t.id, t.status, t.output.length, t.error || "",
     (t.tool_calls || []).map((c) => c.name + c.status).join(",")].join(":")).join("|");
@@ -224,6 +224,14 @@ $("ask").onsubmit = async (ev) => {
   } catch (e) { alert(e.message); }
   finally { $("send").disabled = false; }
 };
+
+// Ctrl+Enter (Cmd+Enter on macOS) sends; plain Enter still inserts a newline.
+$("prompt").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
+    ev.preventDefault();
+    $("ask").requestSubmit();
+  }
+});
 
 $("cancel").onclick = async () => {
   const id = $("cancel").dataset.id;
