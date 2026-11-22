@@ -149,3 +149,4 @@ export const tasksDir = (settings: Settings): string => join(settings.stateDir, 
 export const workspacesDir = (settings: Settings): string => join(settings.stateDir, "workspaces");
 export const toolsDir = (settings: Settings): string => join(settings.stateDir, "tools");
 export const toolCacheDir = (settings: Settings): string => join(settings.stateDir, "tool-cache");
+export const artifactsDir = (settings: Settings): string => join(settings.stateDir, "artifacts");

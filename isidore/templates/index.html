@@ -160,12 +160,14 @@ function render(tasks) {
   $("tasks").innerHTML = [...threads.entries()].map(([root, turns]) => {
     // tasks arrive newest first, so turns[0] is the latest state of the thread.
     const t = turns[0];
+    const fileCount = turns.reduce((count, turn) => count + (Array.isArray(turn.artifacts) ? turn.artifacts.length : 0), 0);
     return `
     <article class="task" data-open="${esc(root)}">
       <header>
         <span class="id">${esc(root)}</span>
         <span class="status ${esc(t.status)}">${spinner(t.status)}${esc(t.status)}</span>
         ${turns.length > 1 ? `<span class="badge">${turns.length} turns</span>` : ""}
+        ${fileCount ? `<span class="badge">${fileCount} file${fileCount === 1 ? "" : "s"}</span>` : ""}
         ${t.exit_code !== null && t.exit_code !== undefined ? `<span class="id">exit ${esc(t.exit_code)}</span>` : ""}
         ${t.done ? `<button class="ghost" data-delete="${esc(root)}">delete</button>` : `<button class="ghost" data-cancel="${esc(t.id)}">cancel</button>`}
       </header>
