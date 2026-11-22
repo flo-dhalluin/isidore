@@ -83,6 +83,11 @@ test("serves the UI, API and runs a task end to end", async () => {
     assert.equal(logo.statusCode, 200);
     assert.match(String(logo.headers["content-type"]), /image\/svg\+xml/);
     assert.match(logo.body, /<svg/);
+    // The PNG version is served too, for the bot logo/avatar.
+    const logoPng = await app.inject({ method: "GET", url: "/loutre-tete.png" });
+    assert.equal(logoPng.statusCode, 200);
+    assert.match(String(logoPng.headers["content-type"]), /image\/png/);
+    assert.match(logoPng.rawPayload.toString("latin1"), /^\x89PNG/);
 
     const taskPage = await app.inject({ method: "GET", url: "/tasks/t_abc", headers: adminAuth });
     assert.equal(taskPage.statusCode, 200);

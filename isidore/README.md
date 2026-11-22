@@ -237,6 +237,9 @@ children cannot read their own `/proc/self`.
 ## Telegram
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) and copy the token.
+   For the bot avatar, send BotFather `/setuserpic` and upload
+   `templates/loutre-tete.png` (also served at `/loutre-tete.png`); the Bot API
+   has no method to set a bot's profile photo.
 2. Send the bot a message, then find your chat id (e.g. with
    `https://api.telegram.org/bot<token>/getUpdates`).
 3. Write the token to a 0600 file and set `ISIDORE_TELEGRAM_TOKEN_FILE` (its
@@ -253,7 +256,8 @@ authenticated by Telegram's `X-Telegram-Bot-Api-Secret-Token` header, not by
 `ISIDORE_TOKEN`; the secret defaults to an HMAC of the bot token
 (override with `ISIDORE_TELEGRAM_WEBHOOK_SECRET[_FILE]`). An empty allow-list denies
 everyone. Commands: `/new <prompt>` (plain text also works), `/list`,
-`/status <id>`, `/cancel <id>`, `/tools`, `/approve <id>`, `/help`. The
+`/status <id>`, `/cancel <id>`, `/tools`, `/approve <id>`, `/help`; `/start`
+sends the bot logo with the help text. The
 originating chat is notified once
 when a task finishes (only if it is an allowed chat). Replying to a bot message
 that names a task queues a follow-up turn in that task's thread.

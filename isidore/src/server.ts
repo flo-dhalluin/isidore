@@ -92,14 +92,17 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
   // 401). Approval here is the only path that makes a tool active+global.
   registerToolsApi(app, { registry, tokens, adminToken, toolCacheRoot });
 
-  // Logo/favicon: a public static asset (no secrets), so the browser can fetch
-  // it without the admin token. Served from templates/ next to the pages.
-  app.get("/loutre-tete.svg", async (_request, reply) => {
-    return reply
-      .type("image/svg+xml")
-      .header("cache-control", "public, max-age=86400")
-      .send(readTemplateAsset("loutre-tete.svg"));
-  });
+  // Logo/favicon: public static assets (no secrets), so the browser can fetch
+  // them without the admin token. Served from templates/ next to the pages.
+  const logos = [
+    ["loutre-tete.svg", "image/svg+xml"],
+    ["loutre-tete.png", "image/png"],
+  ] as const;
+  for (const [name, type] of logos) {
+    app.get(`/${name}`, async (_request, reply) => {
+      return reply.type(type).header("cache-control", "public, max-age=86400").send(readTemplateAsset(name));
+    });
+  }
 
   // UI routes are admin-only; the token is never injected into the HTML (workers
   // share isidore's network namespace and could harvest it from loopback).
