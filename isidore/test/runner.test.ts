@@ -7,6 +7,7 @@ import { Runner, buildSandboxArgs, buildWorkerRequest, prepareAgentDir, summaris
 import { TaskStore, createTask } from "../src/store.ts";
 import { TokenRegistry } from "../src/tokens.ts";
 import { ToolRegistry, type ResolvedTool } from "../src/tools.ts";
+import { uploadPath } from "../src/uploads.ts";
 
 const SANDBOX_BIN = join(import.meta.dirname, "..", "sandbox", "isidore-sandbox");
 
@@ -75,6 +76,138 @@ test("buildWorkerRequest carries the resolved tool set (additive)", () => {
   assert.deepEqual(request.tools, tools);
   // Without tools the field stays absent (old workers ignore it either way).
   assert.ok(!("tools" in buildWorkerRequest(task, null)));
+});
+
+test("buildWorkerRequest carries images (additive) and omits when empty", () => {
+  const task = createTask("see");
+  const images = [{ data: "AQID", mimeType: "image/png" }];
+  const request = buildWorkerRequest(task, null, null, undefined, images);
+  assert.deepEqual(request.images, images);
+  assert.ok(!("images" in buildWorkerRequest(task, null)));
+  assert.ok(!("images" in buildWorkerRequest(task, null, null, undefined, [])));
+});
+
+test("images travel via the stdin request, never the exec env", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "isidore-runner-"));
+  try {
+    const store = new TaskStore(join(dir, "tasks"));
+    const uploadsRoot = join(dir, "uploads");
+    const script = fakeWorker(dir, "cat > request.json\nenv > env-dump.txt\n");
+    const runner = new Runner({
+      store,
+      workspaceRoot: join(dir, "ws"),
+      workerScript: script,
+      workerBin: "sh",
+      maxWorkers: 1,
+      timeout: null,
+      model: null,
+      mode: "print",
+      unsafeNoSandbox: true,
+      uploadsRoot,
+    });
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const task = createTask("look", {
+      uploads: [
+        {
+          id: "u_0123456789ab",
+          name: "dot.png",
+          size: pngBytes.byteLength,
+          content_type: "image/png",
+          created_at: "2026-01-01T00:00:00.000000+00:00",
+        },
+      ],
+    });
+    const dest = uploadPath(uploadsRoot, task.id, "u_0123456789ab");
+    mkdirSync(join(uploadsRoot, task.id), { recursive: true });
+    writeFileSync(dest, pngBytes);
+
+    runner.submit(task);
+    await waitDone(store, task.id);
+    assert.equal(task.status, "succeeded");
+    const workspace = runner.workspaceFor(task);
+    const request = JSON.parse(readFileSync(join(workspace, "request.json"), "utf8"));
+    assert.deepEqual(request.images, [{ data: pngBytes.toString("base64"), mimeType: "image/png" }]);
+    const dump = readFileSync(join(workspace, "env-dump.txt"), "utf8");
+    assert.ok(!dump.includes(pngBytes.toString("base64")));
+    await runner.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("worker rejects images on a text-only model (defense in depth)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "isidore-runner-"));
+  try {
+    const store = new TaskStore(join(dir, "tasks"));
+    const uploadsRoot = join(dir, "uploads");
+    const sharedPi = join(dir, "shared-pi");
+    mkdirSync(sharedPi, { recursive: true });
+    // Minimal models.json defining a text-only model (no "image" in input).
+    writeFileSync(
+      join(sharedPi, "models.json"),
+      JSON.stringify({
+        providers: {
+          openrouter: {
+            baseUrl: "https://127.0.0.1:1/v1",
+            apiKey: "OPENROUTER_API_KEY",
+            api: "openai-completions",
+            models: [
+              {
+                id: "text-only/model",
+                name: "Text Only",
+                reasoning: false,
+                input: ["text"],
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                contextWindow: 8192,
+                maxTokens: 1024,
+              },
+            ],
+          },
+        },
+      }),
+    );
+
+    const workerScript = join(import.meta.dirname, "..", "src", "worker.ts");
+    const runner = new Runner({
+      store,
+      workspaceRoot: join(dir, "ws"),
+      workerScript,
+      workerBin: process.execPath,
+      maxWorkers: 1,
+      timeout: 15,
+      model: "openrouter/text-only/model",
+      mode: "print",
+      unsafeNoSandbox: true,
+      uploadsRoot,
+      baseEnv: { ...process.env, PI_CODING_AGENT_DIR: sharedPi, OPENROUTER_API_KEY: "sk-dummy" },
+    });
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const task = createTask("look", {
+      uploads: [
+        {
+          id: "u_abcdef012345",
+          name: "dot.png",
+          size: pngBytes.byteLength,
+          content_type: "image/png",
+          created_at: "2026-01-01T00:00:00.000000+00:00",
+        },
+      ],
+    });
+    mkdirSync(join(uploadsRoot, task.id), { recursive: true });
+    writeFileSync(uploadPath(uploadsRoot, task.id, "u_abcdef012345"), pngBytes);
+
+    // Prepare .pi/models.json in workspace since unsafeNoSandbox skips prepareAgentDir.
+    mkdirSync(join(runner.workspaceFor(task), ".pi"), { recursive: true });
+    writeFileSync(join(runner.workspaceFor(task), ".pi", "models.json"), readFileSync(join(sharedPi, "models.json"), "utf8"));
+
+    runner.submit(task);
+    await waitDone(store, task.id, 15_000);
+    assert.equal(task.status, "failed");
+    assert.match(task.error ?? "", /does not support image inputs/);
+    await runner.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("summariseEvent extracts streamed text", () => {

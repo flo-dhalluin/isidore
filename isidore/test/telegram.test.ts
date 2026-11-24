@@ -1,24 +1,44 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
+import { MAX_UPLOAD_BYTES } from "../src/limits.ts";
+import { ModelCapabilities } from "../src/model-capabilities.ts";
 import { TaskStore, createTask, type Task } from "../src/store.ts";
 import { TelegramBot, deriveWebhookSecret } from "../src/telegram.ts";
 import { ToolRegistry, type ToolInput } from "../src/tools.ts";
+import { uploadPath } from "../src/uploads.ts";
 
 type Call = { method: string; body: any };
 
 /** A fake Bot API recording every call; getUpdates returns nothing after a short wait. */
-async function fakeApi(): Promise<{ server: Server; base: string; calls: Call[] }> {
+async function fakeApi(files: Record<string, Buffer> = {}): Promise<{ server: Server; base: string; calls: Call[] }> {
   const calls: Call[] = [];
   const server = createServer((request, response) => {
+    const url = request.url ?? "";
+    if (request.method === "GET" && url.includes("/file/bot")) {
+      const idx = url.indexOf("/file/bot");
+      const rest = url.slice(idx + "/file/bot".length);
+      const slash = rest.indexOf("/");
+      const filePath = slash === -1 ? "" : rest.slice(slash + 1);
+      const data = files[filePath];
+      if (!data) {
+        response.statusCode = 404;
+        response.end("not found");
+        return;
+      }
+      response.statusCode = 200;
+      response.setHeader("content-length", String(data.byteLength));
+      response.end(data);
+      return;
+    }
     let raw = "";
     request.on("data", (chunk) => (raw += chunk));
     request.on("end", () => {
-      const method = (request.url ?? "").split("?")[0].split("/").pop() ?? "";
+      const method = url.split("?")[0].split("/").pop() ?? "";
       let body: any = null;
       if (raw) {
         try {
@@ -28,6 +48,22 @@ async function fakeApi(): Promise<{ server: Server; base: string; calls: Call[] 
         }
       }
       calls.push({ method, body });
+      if (method === "getFile") {
+        const fileId = String(body?.file_id ?? "");
+        const filePath = `photos/${fileId}.bin`;
+        const fileData = files[filePath];
+        response.end(
+          JSON.stringify({
+            ok: true,
+            result: {
+              file_id: fileId,
+              file_path: filePath,
+              ...(fileData ? { file_size: fileData.byteLength } : {}),
+            },
+          }),
+        );
+        return;
+      }
       const result = method === "getUpdates" ? [] : method === "sendPhoto" ? { photo: [{ file_id: "logo-file" }] } : true;
       setTimeout(() => response.end(JSON.stringify({ ok: true, result })), method === "getUpdates" ? 20 : 0);
     });
@@ -352,5 +388,213 @@ test("/tools and /approve are gated to allowed chats", async () => {
     bot.handleWebhook(secret, message("/tools"));
     await until(() => sent().length === 1);
     assert.ok(sent()[0].body.text.includes(pending.id));
+  });
+});
+
+const TG_PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01, 0x02]);
+const TG_JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46]);
+
+function visionCaps(modalities: Record<string, string[]> | "fail"): ModelCapabilities {
+  return new ModelCapabilities({
+    retryCooldownMs: 0,
+    fetchFn: (async () => {
+      if (modalities === "fail") return new Response("down", { status: 503 });
+      return new Response(
+        JSON.stringify({
+          data: Object.entries(modalities).map(([id, m]) => ({ id, architecture: { input_modalities: m } })),
+        }),
+        { status: 200 },
+      );
+    }) as typeof fetch,
+  });
+}
+
+async function withPhotoBot(
+  files: Record<string, Buffer>,
+  caps: ModelCapabilities,
+  defaultModel: string,
+  run: (ctx: {
+    bot: TelegramBot;
+    store: TaskStore;
+    uploadsRoot: string;
+    api: Awaited<ReturnType<typeof fakeApi>>;
+    secret: string;
+  }) => Promise<void>,
+): Promise<void> {
+  const api = await fakeApi(files);
+  const dir = mkdtempSync(join(tmpdir(), "isidore-tg-photo-"));
+  const store = new TaskStore(join(dir, "tasks"), 10_000);
+  const uploadsRoot = join(dir, "uploads");
+  const runner = {
+    create: (prompt: string, overrides: Partial<Task> = {}) => {
+      const task = createTask(prompt, overrides);
+      store.add(task);
+      return task;
+    },
+    cancel: () => false,
+  };
+  const bot = new TelegramBot("123:secret-token", runner as any, store, new Set(["42"]), {
+    apiBase: api.base,
+    webhookUrl: "https://example.com/telegram/webhook",
+    uploadsRoot,
+    capabilities: caps,
+    defaultModel,
+    albumDebounceMs: 40,
+  });
+  try {
+    await run({ bot, store, uploadsRoot, api, secret: deriveWebhookSecret("123:secret-token") });
+  } finally {
+    await bot.stop();
+    api.server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("Telegram handles photo, image document, and photo reply follow-ups", async () => {
+  const files: Record<string, Buffer> = {
+    "photos/small.bin": TG_PNG,
+    "photos/large.bin": TG_JPEG,
+    "photos/doc1.bin": TG_PNG,
+  };
+  const caps = visionCaps({ "vision/m": ["text", "image"] });
+  await caps.refresh();
+
+  await withPhotoBot(files, caps, "openrouter/vision/m", async ({ bot, store, uploadsRoot, api, secret }) => {
+    const sent = () => api.calls.filter((c) => c.method === "sendMessage");
+
+    // 1. Photo selects largest PhotoSize under MAX_UPLOAD_BYTES and uses caption as prompt.
+    bot.handleWebhook(secret, {
+      update_id: updateId++,
+      message: {
+        chat: { id: 42 },
+        caption: "what is this?",
+        photo: [
+          { file_id: "small", width: 100, height: 100, file_size: 100 },
+          { file_id: "large", width: 800, height: 600, file_size: 200 },
+          { file_id: "huge", width: 4000, height: 4000, file_size: MAX_UPLOAD_BYTES + 10 },
+        ],
+      },
+    });
+    await until(() => store.list(10).length === 1);
+    const task1 = store.list(10)[0];
+    assert.equal(task1.prompt, "what is this?");
+    assert.equal(task1.uploads.length, 1);
+    assert.equal(task1.uploads[0].content_type, "image/jpeg");
+    assert.deepEqual(readFileSync(uploadPath(uploadsRoot, task1.id, task1.uploads[0].id)), TG_JPEG);
+    await until(() => sent().length === 1);
+    assert.match(sent()[0].body.text, /1 image/);
+
+    // 2. Photo-reply to bot task message continues the conversation.
+    finish(store, task1, "it is a jpeg");
+    bot.handleWebhook(secret, {
+      update_id: updateId++,
+      message: {
+        chat: { id: 42 },
+        caption: "now check this document",
+        document: { file_id: "doc1", file_name: "scan.png", mime_type: "image/png", file_size: TG_PNG.byteLength },
+        reply_to_message: { from: { id: 123, is_bot: true }, text: `${task1.id}  succeeded\nit is a jpeg` },
+      },
+    });
+    await until(() => store.list(10).length === 2);
+    const follow = store.list(10).find((t) => t.prompt === "now check this document")!;
+    assert.equal(follow.thread_id, task1.id);
+    assert.equal(follow.parent_id, task1.id);
+    assert.equal(follow.uploads.length, 1);
+    assert.equal(follow.uploads[0].name, "scan.png");
+    assert.ok(existsSync(uploadPath(uploadsRoot, task1.id, follow.uploads[0].id)));
+    await until(() => sent().length === 2);
+    assert.match(sent()[1].body.text, /follow-up of/);
+  });
+});
+
+test("Telegram debounces media_group_id albums into one turn (max 4 images)", async () => {
+  const files: Record<string, Buffer> = {
+    "photos/a1.bin": TG_PNG,
+    "photos/a2.bin": TG_JPEG,
+    "photos/a3.bin": TG_PNG,
+  };
+  const caps = visionCaps({ "vision/m": ["text", "image"] });
+  await caps.refresh();
+
+  await withPhotoBot(files, caps, "openrouter/vision/m", async ({ bot, store, api, secret }) => {
+    const sent = () => api.calls.filter((c) => c.method === "sendMessage");
+
+    for (const [idx, fid] of ["a1", "a2", "a3"].entries()) {
+      bot.handleWebhook(secret, {
+        update_id: updateId++,
+        message: {
+          chat: { id: 42 },
+          media_group_id: "grp-1",
+          ...(idx === 0 ? { caption: "compare these three" } : {}),
+          photo: [{ file_id: fid, width: 400, height: 400, file_size: 100 }],
+        },
+      });
+    }
+    await until(() => store.list(10).length === 1);
+    const task = store.list(10)[0];
+    assert.equal(task.prompt, "compare these three");
+    assert.equal(task.uploads.length, 3);
+    await until(() => sent().length === 1);
+    assert.match(sent()[0].body.text, /3 images/);
+  });
+});
+
+test("Telegram photo handling gates on vision capability, rejects disguised SVG, and never leaks token URLs", async () => {
+  const files: Record<string, Buffer> = {
+    "photos/svg.bin": Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>'),
+    "photos/missing.bin": TG_PNG,
+  };
+  const textCaps = visionCaps({ "text/m": ["text"] });
+  await textCaps.refresh();
+
+  // Text-only model rejects photos with a helpful error.
+  await withPhotoBot(files, textCaps, "openrouter/text/m", async ({ bot, store, api, secret }) => {
+    const sent = () => api.calls.filter((c) => c.method === "sendMessage");
+    bot.handleWebhook(secret, {
+      update_id: updateId++,
+      message: { chat: { id: 42 }, photo: [{ file_id: "svg", width: 100, height: 100 }] },
+    });
+    await until(() => sent().length === 1);
+    assert.match(sent()[0].body.text, /does not support images/);
+    assert.equal(store.list(10).length, 0);
+  });
+
+  // Disguised SVG & missing file download fail cleanly without leaking bot token.
+  const okCaps = visionCaps({ "vision/m": ["text", "image"] });
+  await okCaps.refresh();
+  await withPhotoBot(files, okCaps, "openrouter/vision/m", async ({ bot, store, api, secret }) => {
+    const sent = () => api.calls.filter((c) => c.method === "sendMessage");
+    bot.handleWebhook(secret, {
+      update_id: updateId++,
+      message: {
+        chat: { id: 42 },
+        document: { file_id: "svg", file_name: "fake.png", mime_type: "image/png" },
+      },
+    });
+    await until(() => sent().length === 1);
+    assert.match(sent()[0].body.text, /unsupported image format/i);
+    assert.ok(!sent()[0].body.text.includes("secret-token"));
+
+    bot.handleWebhook(secret, {
+      update_id: updateId++,
+      message: { chat: { id: 42 }, photo: [{ file_id: "nope", width: 100, height: 100 }] },
+    });
+    await until(() => sent().length === 2);
+    assert.match(sent()[1].body.text, /Failed to download image/);
+    assert.ok(!sent()[1].body.text.includes("secret-token"));
+    assert.equal(store.list(10).length, 0);
+  });
+
+  // Unavailable capabilities fail closed.
+  const failedCaps = visionCaps("fail");
+  await withPhotoBot(files, failedCaps, "openrouter/vision/m", async ({ bot, store, api, secret }) => {
+    const sent = () => api.calls.filter((c) => c.method === "sendMessage");
+    bot.handleWebhook(secret, {
+      update_id: updateId++,
+      message: { chat: { id: 42 }, photo: [{ file_id: "missing", width: 100, height: 100 }] },
+    });
+    await until(() => sent().length === 1);
+    assert.match(sent()[0].body.text, /capabilities unavailable/);
+    assert.equal(store.list(10).length, 0);
   });
 });

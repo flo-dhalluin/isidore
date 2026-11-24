@@ -57,6 +57,18 @@
         max-height: 22rem; white-space: pre-wrap; word-break: break-word; font-size: .82rem; }
   .empty { color: var(--muted); }
   .err { color: #c53030; }
+  textarea.drag-over { border-color: var(--accent); background: rgba(127,127,127,.06); }
+  .upload-chips { display: flex; flex-wrap: wrap; gap: .45rem; margin-top: .5rem; }
+  .upload-chips:empty { display: none; }
+  .upload-chip { display: inline-flex; align-items: center; gap: .4rem; border: 1px solid var(--line);
+                 padding: .25rem .4rem; font-size: .75rem; max-width: 15rem; }
+  .upload-chip img { width: 2rem; height: 2rem; object-fit: cover; border-radius: 2px; flex: 0 0 auto; }
+  .upload-chip .upload-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .upload-chip .upload-rm { background: transparent; color: var(--muted); border: 0; padding: 0 .25rem;
+                            font: inherit; cursor: pointer; line-height: 1; }
+  .upload-chip .upload-rm:hover { color: #c53030; }
+  .hint { color: var(--muted); font-size: .8rem; margin: .45rem 0 0; }
+  #upload-err { margin: .45rem 0 0; font-size: .82rem; }
   h2 { font-size: .85rem; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin: 0 0 .6rem; }
   .schedule { border: 1px solid var(--line); padding: .7rem .8rem; }
   .schedule header { display: flex; gap: .6rem; align-items: baseline; flex-wrap: wrap; }
@@ -72,11 +84,16 @@
     <main>
       <form id="run">
         <textarea id="prompt" placeholder="What should the agent do?" required></textarea>
+        <input id="image-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
+        <div class="upload-chips" id="upload-chips"></div>
         <div class="row">
           <select id="model-select" hidden></select>
           <input id="model-input" placeholder="model (optional, e.g. openrouter/anthropic/claude-sonnet-4)">
+          <button type="button" class="ghost" id="attach-btn">Attach image</button>
           <button type="submit">Run now</button>
         </div>
+        <p class="hint" id="vision-hint" hidden></p>
+        <p class="err" id="upload-err" hidden></p>
       </form>
 
       <div class="tasks" id="tasks"><p class="empty">Loading…</p></div>
@@ -96,17 +113,130 @@ const TOKEN = new URLSearchParams(location.search).get("token") || "";
 if (TOKEN) { $("tools-link").href = "/tools?token=" + encodeURIComponent(TOKEN); }
 let scheduler = false;
 let modelPicker = null;
+let visionModels = new Set();
+let infoLoaded = false;
+const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
+const MAX_UPLOADS = 4;
+const ALLOWED_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+let pendingImages = [];
+
+function canAttachImages() {
+  if (!infoLoaded) return false;
+  const m = chosenModel();
+  if (!m) return false;
+  return visionModels.has(m);
+}
+
+function updateAttachState() {
+  const ok = canAttachImages();
+  const btn = $("attach-btn");
+  const hint = $("vision-hint");
+  btn.disabled = !ok;
+  btn.hidden = !ok;
+  hint.hidden = ok;
+  if (!ok) {
+    hint.textContent = "select a vision-capable model to attach images";
+  }
+}
+
+function setUploadError(msg) {
+  const el = $("upload-err");
+  if (!msg) { el.hidden = true; el.textContent = ""; return; }
+  el.textContent = msg;
+  el.hidden = false;
+}
+
+function fmtSize(bytes) {
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + " KB";
+  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+function renderChips() {
+  $("upload-chips").innerHTML = pendingImages.map((item, idx) => `
+    <div class="upload-chip">
+      <img src="${esc(item.url)}" alt="${esc(item.file.name)}">
+      <span class="upload-name" title="${esc(item.file.name)} (${esc(fmtSize(item.file.size))})">${esc(item.file.name)}</span>
+      <button type="button" class="upload-rm" data-rm-img="${idx}" title="Remove">&times;</button>
+    </div>`).join("");
+  document.querySelectorAll("[data-rm-img]").forEach((b) => {
+    b.onclick = () => {
+      const idx = Number(b.dataset.rmImg);
+      const removed = pendingImages.splice(idx, 1);
+      for (const r of removed) URL.revokeObjectURL(r.url);
+      setUploadError("");
+      renderChips();
+    };
+  });
+}
+
+function clearPendingImages() {
+  for (const item of pendingImages) URL.revokeObjectURL(item.url);
+  pendingImages = [];
+  renderChips();
+}
+
+function addFiles(files) {
+  setUploadError("");
+  if (!canAttachImages()) {
+    setUploadError("select a vision-capable model to attach images");
+    return;
+  }
+  for (const file of files) {
+    if (pendingImages.length >= MAX_UPLOADS) {
+      setUploadError("maximum " + MAX_UPLOADS + " images per turn");
+      break;
+    }
+    if (file.size > MAX_UPLOAD_BYTES) {
+      setUploadError(file.name + " exceeds the 8 MB limit");
+      continue;
+    }
+    if (file.type && !ALLOWED_TYPES.has(file.type)) {
+      setUploadError(file.name + ": unsupported format (PNG, JPEG, GIF, WebP only)");
+      continue;
+    }
+    pendingImages.push({ file, url: URL.createObjectURL(file), id: null });
+  }
+  renderChips();
+}
+
+async function uploadPendingImages() {
+  const ids = [];
+  for (const item of pendingImages) {
+    if (item.id) { ids.push(item.id); continue; }
+    const headers = {"Content-Type": item.file.type || "application/octet-stream"};
+    if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
+    const url = "/api/uploads?name=" + encodeURIComponent(item.file.name || "image.png");
+    const res = await fetch(url, {method: "POST", headers, body: item.file});
+    if (!res.ok) {
+      let errMsg = res.statusText;
+      try { const j = await res.json(); if (j && j.error) errMsg = j.error; } catch {}
+      throw new Error(errMsg);
+    }
+    const meta = await res.json();
+    item.id = meta.id;
+    ids.push(meta.id);
+  }
+  return ids;
+}
 
 /** Use the server's model whitelist as a dropdown; keep free text when unset. */
 function setupModelPicker(info) {
+  infoLoaded = true;
+  visionModels = new Set(Array.isArray(info.vision_models) ? info.vision_models : []);
   const models = Array.isArray(info.models) ? info.models : [];
-  if (!models.length) return;
-  const select = $("model-select");
-  select.innerHTML = models.map((model) =>
-    `<option value="${esc(model)}"${model === info.default_model ? " selected" : ""}>${esc(model)}</option>`).join("");
-  select.hidden = false;
-  $("model-input").hidden = true;
-  modelPicker = select;
+  if (models.length) {
+    const select = $("model-select");
+    select.innerHTML = models.map((model) =>
+      `<option value="${esc(model)}"${model === info.default_model ? " selected" : ""}>${esc(model)}</option>`).join("");
+    select.hidden = false;
+    $("model-input").hidden = true;
+    modelPicker = select;
+    select.onchange = () => { setUploadError(""); updateAttachState(); };
+  } else {
+    $("model-input").oninput = () => updateAttachState();
+  }
+  updateAttachState();
 }
 
 function chosenModel() {
@@ -161,12 +291,14 @@ function render(tasks) {
     // tasks arrive newest first, so turns[0] is the latest state of the thread.
     const t = turns[0];
     const fileCount = turns.reduce((count, turn) => count + (Array.isArray(turn.artifacts) ? turn.artifacts.length : 0), 0);
+    const imgCount = turns.reduce((count, turn) => count + (Array.isArray(turn.uploads) ? turn.uploads.length : 0), 0);
     return `
     <article class="task" data-open="${esc(root)}">
       <header>
         <span class="id">${esc(root)}</span>
         <span class="status ${esc(t.status)}">${spinner(t.status)}${esc(t.status)}</span>
         ${turns.length > 1 ? `<span class="badge">${turns.length} turns</span>` : ""}
+        ${imgCount ? `<span class="badge">${imgCount} image${imgCount === 1 ? "" : "s"}</span>` : ""}
         ${fileCount ? `<span class="badge">${fileCount} file${fileCount === 1 ? "" : "s"}</span>` : ""}
         ${t.exit_code !== null && t.exit_code !== undefined ? `<span class="id">exit ${esc(t.exit_code)}</span>` : ""}
         ${t.done ? `<button class="ghost" data-delete="${esc(root)}">delete</button>` : `<button class="ghost" data-cancel="${esc(t.id)}">cancel</button>`}
@@ -266,15 +398,46 @@ async function refresh() {
   catch (e) { $("tasks").innerHTML = `<p class="err">${esc(e.message)}</p>`; }
 }
 
+$("attach-btn").onclick = () => $("image-input").click();
+$("image-input").onchange = (ev) => {
+  if (ev.target.files && ev.target.files.length) addFiles(ev.target.files);
+  ev.target.value = "";
+};
+
+const promptEl = $("prompt");
+promptEl.addEventListener("dragenter", (ev) => { ev.preventDefault(); promptEl.classList.add("drag-over"); });
+promptEl.addEventListener("dragover", (ev) => { ev.preventDefault(); promptEl.classList.add("drag-over"); });
+promptEl.addEventListener("dragleave", () => { promptEl.classList.remove("drag-over"); });
+promptEl.addEventListener("drop", (ev) => {
+  ev.preventDefault();
+  promptEl.classList.remove("drag-over");
+  if (ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files.length) {
+    addFiles(ev.dataTransfer.files);
+  }
+});
+promptEl.addEventListener("paste", (ev) => {
+  const items = ev.clipboardData && ev.clipboardData.items ? [...ev.clipboardData.items] : [];
+  const files = items.filter((item) => item.kind === "file" && item.type.startsWith("image/")).map((item) => item.getAsFile()).filter(Boolean);
+  if (files.length) {
+    ev.preventDefault();
+    addFiles(files);
+  }
+});
+
 $("run").onsubmit = async (ev) => {
   ev.preventDefault();
-  const button = ev.submitter || ev.target.querySelector("button");
+  setUploadError("");
+  const button = ev.submitter || ev.target.querySelector('button[type="submit"]');
   button.disabled = true;
   try {
-    await api("/api/tasks", {method: "POST", body: JSON.stringify({prompt: $("prompt").value, model: chosenModel()})});
+    const uploads = pendingImages.length ? await uploadPendingImages() : [];
+    const payload = {prompt: $("prompt").value, model: chosenModel()};
+    if (uploads.length) payload.uploads = uploads;
+    await api("/api/tasks", {method: "POST", body: JSON.stringify(payload)});
     $("prompt").value = "";
+    clearPendingImages();
     refresh();
-  } catch (e) { alert(e.message); }
+  } catch (e) { setUploadError(e.message); }
   finally { button.disabled = false; }
 };
 

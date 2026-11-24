@@ -295,3 +295,41 @@ admin token fetches the bytes from
 gets 404 for that artifact. `send_file(path="/state/shared/admin-token")` is
 refused (outside the workspace).
 
+## 12. Images (web upload + Telegram + Landlock Photon resize)
+
+Automated: `test/uploads.test.ts`, `test/model-capabilities.test.ts`,
+`test/server.test.ts`, `test/runner.test.ts` (incl. `worker.ts` defense-in-depth
+text-only rejection), `test/store.test.ts`, `test/telegram.test.ts`.
+
+Manual end-to-end check (real vision model via OpenRouter, Landlock sandbox ON):
+
+```sh
+ADMIN=$(docker compose exec -T isidore cat /state/shared/admin-token)
+
+# Verify capabilities loaded and vision_models populated:
+curl -s localhost:8920/api/info -H "Authorization: Bearer $ADMIN" | jq '{default_model, vision_models}'
+
+# Upload a large (>2000px) PNG/JPEG so Pi SDK exercises Photon WASM resize inside Landlock:
+UP=$(curl -s -X POST "localhost:8920/api/uploads?name=big.png" \
+       -H "Authorization: Bearer $ADMIN" -H "Content-Type: image/png" \
+       --data-binary @/path/to/large-image.png | jq -r .id)
+
+# Run against a vision-capable model:
+curl -s -X POST localhost:8920/api/tasks -H "Authorization: Bearer $ADMIN" \
+  -H "content-type: application/json" \
+  -d "{\"prompt\":\"Describe what is in this image.\",\"model\":\"openrouter/qwen/qwen4-max\",\"uploads\":[\"$UP\"]}"
+```
+
+Expected:
+- The task succeeds with an accurate description of the image (confirming Photon
+  resize/WASM works inside the Landlock sandbox without EACCES).
+- The task view renders the uploaded thumbnail in the "you" section and serves
+  it via `GET /api/tasks/<id>/uploads/<uploadId>` with `nosniff` + attachment
+  headers.
+- A follow-up turn without re-uploading retains image context from the session
+  JSONL.
+- Sending a photo (and a multi-photo album) to the Telegram bot queues a single
+  turn with the images attached; replying to a bot task message with a photo
+  continues that conversation.
+
+

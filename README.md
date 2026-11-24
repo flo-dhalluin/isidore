@@ -168,10 +168,13 @@ no public URL or open port. A [webhook](#webhook-optional) is optional.
    if set) should report `"telegram": true, "telegram_mode": "polling"`.
 4. **Use it**: send plain text or `/new <prompt>` to queue a task; `/start`
    replies with the bot logo; `/list`,
-   `/status <id>`, `/cancel <id>`, `/tools`, `/approve <id>`, `/help`. The
+   `/status <id>`, `/cancel <id>`, `/tools`, `/approve <id>`, `/help`. Send a
+   photo, image document, or album (up to 4 images, ≤8 MiB each, with optional
+   caption) to run a vision task when the active model supports images. The
    originating chat gets the task's
    output when it finishes (split into several messages if long).
-   **Reply** to any of the bot's task messages to continue that conversation:
+   **Reply** to any of the bot's task messages (with text or a photo) to
+   continue that conversation:
    the reply becomes the next turn of the thread, with the same workspace and
    Pi session (refused while a turn of it is still running).
    Schedules the agent creates from a Telegram task (`schedule_task`) post
@@ -311,6 +314,27 @@ task's workspace (symlink escapes are refused), and the download route
 with `nosniff`, so agent-authored HTML/SVG cannot run in the UI's origin.
 Limits: 50 MB per file, 32 files per turn; deleting the conversation deletes
 its artifacts.
+
+## Images
+
+When a vision-capable model is selected, you can attach images from the web UI
+(file picker, drag-and-drop, or clipboard paste), via `POST /api/uploads` +
+`POST /api/tasks` (or `/followup`), or directly through Telegram (photos, image
+documents, and `media_group_id` albums).
+
+- **Supported formats**: PNG, JPEG, GIF, WebP (magic-byte sniffed; SVG is
+  rejected).
+- **Limits**: 8 MiB per image (raw), 4 images per turn, 1 h staging TTL.
+- **Model gating**: capabilities are fetched from OpenRouter's public
+  `/api/v1/models` endpoint (`architecture.input_modalities`, ~1 h cache,
+  fail-closed `503` when unknown/unavailable, `400` on text-only models) and
+  re-checked in the worker before prompting.
+- **Isolation**: the upload store (`<stateDir>/uploads/`) is service-only and
+  never Landlock-allow-listed; images travel to the worker over stdin JSON, are
+  served back to the UI with `nosniff` + attachment headers, and are deleted
+  with the conversation. Note that switching a conversation with image history
+  to a text-only model may fail at the provider (Pi keeps images in the session
+  JSONL), and scheduled tasks remain text-only.
 
 Residual risks (unchanged from the isolation model): all tasks share one uid
 and Landlock ABI 4 does not scope signals, so a task can `kill` another

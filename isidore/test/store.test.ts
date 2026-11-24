@@ -92,3 +92,28 @@ test("public task exposes done", () => {
   task.status = "succeeded";
   assert.equal(publicTask(task).done, true);
 });
+
+test("uploads persist and reload from disk", () => {
+  const dir = tempDir();
+  try {
+    const store = new TaskStore(dir);
+    const upload = {
+      id: "u_0123456789ab",
+      name: "cat.png",
+      size: 123,
+      content_type: "image/png",
+      created_at: "2026-01-01T00:00:00.000000+00:00",
+    };
+    const task = store.add(createTask("describe", { uploads: [upload] }));
+    assert.deepEqual(publicTask(task).uploads, [upload]);
+
+    const reloaded = new TaskStore(dir);
+    assert.deepEqual(reloaded.get(task.id)?.uploads, [upload]);
+
+    // Corrupt non-array uploads field is normalized to [].
+    writeFileSync(join(dir, "t_corruptup00.json"), JSON.stringify({ id: "t_corruptup00", prompt: "x", uploads: "bad" }));
+    assert.deepEqual(new TaskStore(dir).get("t_corruptup00")?.uploads, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

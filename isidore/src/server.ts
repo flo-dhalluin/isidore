@@ -3,11 +3,13 @@ import { createReadStream, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { artifactPath, contentDisposition, removeConversationArtifacts } from "./artifacts.ts";
 import { deny, resolveAuth } from "./auth.ts";
-import { artifactsDir, generateAdminToken, tasksDir, toolCacheDir, toolsDir, workspacesDir, writeAdminToken, type Settings } from "./config.ts";
+import { artifactsDir, generateAdminToken, tasksDir, toolCacheDir, toolsDir, uploadsDir, workspacesDir, writeAdminToken, type Settings } from "./config.ts";
+import { MAX_UPLOAD_BYTES, MAX_UPLOADS_PER_TURN } from "./limits.ts";
+import { ModelCapabilities } from "./model-capabilities.ts";
 import { Runner } from "./runner.ts";
 import { SchedulerClient } from "./scheduler.ts";
 import { TelegramBot } from "./telegram.ts";
-import { TaskStore, isDone, publicTask, rootId } from "./store.ts";
+import { TaskStore, isDone, newId, publicTask, rootId, type Upload } from "./store.ts";
 import { readTemplateAsset, renderTemplate } from "./templates.ts";
 import { TokenRegistry } from "./tokens.ts";
 import { ToolRegistry } from "./tools.ts";
@@ -15,6 +17,16 @@ import { removeToolCacheCopies } from "./tool-cache.ts";
 import { registerToolsApi } from "./tools-api.ts";
 import { registerToolsMcp } from "./tools-mcp.ts";
 import { registerFilesMcp } from "./files-mcp.ts";
+import {
+  ALLOWED_IMAGE_MIMES,
+  UploadError,
+  adoptUploads,
+  isValidUploadId,
+  removeConversationUploads,
+  stageUpload,
+  sweepUploadStaging,
+  uploadPath,
+} from "./uploads.ts";
 
 const MAX_PROMPT = 100_000;
 
@@ -22,7 +34,33 @@ function notFound(reply: FastifyReply): void {
   reply.code(404).send({ error: "not found" });
 }
 
-export async function createApp(settings: Settings): Promise<{ app: FastifyInstance; tokens: TokenRegistry }> {
+function parseUploadIds(raw: unknown): string[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new UploadError(400, "uploads must be an array of upload ids");
+  if (raw.length > MAX_UPLOADS_PER_TURN) {
+    throw new UploadError(400, `too many images (max ${MAX_UPLOADS_PER_TURN} per turn)`);
+  }
+  const ids: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== "string" || !isValidUploadId(item)) {
+      throw new UploadError(400, `invalid upload id: ${String(item)}`);
+    }
+    ids.push(item);
+  }
+  if (new Set(ids).size !== ids.length) {
+    throw new UploadError(400, "duplicate upload id");
+  }
+  return ids;
+}
+
+export interface CreateAppOptions {
+  capabilities?: ModelCapabilities;
+}
+
+export async function createApp(
+  settings: Settings,
+  options: CreateAppOptions = {},
+): Promise<{ app: FastifyInstance; tokens: TokenRegistry; capabilities: ModelCapabilities }> {
   const tokens = new TokenRegistry();
   // Defense in depth: loadSettings always sets a token, but a programmatic/test
   // caller may pass null. Never run unauthenticated.
@@ -42,6 +80,12 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
   // env + port feed builtinManifests (builtin:tools URL fallback, Phase 3).
   const registry = new ToolRegistry(toolsDir(settings), process.env, settings.port);
   const toolCacheRoot = toolCacheDir(settings);
+  const uploadsRoot = uploadsDir(settings);
+  sweepUploadStaging(uploadsRoot);
+  const capabilities = options.capabilities ?? new ModelCapabilities();
+  if (!options.capabilities) {
+    void capabilities.refresh();
+  }
   const scheduler = new SchedulerClient(settings.schedulerUrl, settings.schedulerToken, undefined, settings.schedulerTokenFile);
   let bot: TelegramBot | null = null;
 
@@ -61,6 +105,7 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
     registry,
     toolCacheRoot,
     toolsUrl: settings.toolsUrl,
+    uploadsRoot,
   });
 
   if (settings.telegramToken) {
@@ -68,11 +113,20 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
       webhookUrl: settings.telegramWebhookUrl,
       webhookSecret: settings.telegramWebhookSecret,
       registry,
+      uploadsRoot,
+      capabilities,
+      defaultModel: settings.model,
     });
     void bot.run();
   }
 
   const app = Fastify({ logger: true });
+
+  for (const mime of [...ALLOWED_IMAGE_MIMES, "application/octet-stream"]) {
+    app.addContentTypeParser(mime, { parseAs: "buffer" }, (_request, body, done) => {
+      done(null, body);
+    });
+  }
 
   // Tools authoring MCP (Phase 3): stateless streamable-HTTP JSON-RPC, scoped
   // to the caller's conversation via the same resolveAuth as the REST API.
@@ -145,16 +199,49 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
   app.get("/api/info", async (request, reply) => {
     const auth = resolveAuth(request, adminToken, tokens);
     if (!auth) return deny(reply);
+    void capabilities.ensureFresh();
     return {
       scheduler: scheduler.enabled,
       model: settings.model,
       default_model: settings.model,
       models: settings.models,
+      vision_models: capabilities.visionModels(settings.models),
       max_workers: settings.maxWorkers,
       telegram: Boolean(settings.telegramToken),
       telegram_mode: bot?.mode ?? null,
     };
   });
+
+  // Binary image upload (admin-only); sniffs magic bytes and stages into
+  // <uploadsRoot>/_staging/<uploadId> before a turn references it.
+  app.post(
+    "/api/uploads",
+    {
+      bodyLimit: MAX_UPLOAD_BYTES,
+      onRequest: async (request, reply) => {
+        const auth = resolveAuth(request, adminToken, tokens);
+        if (auth?.kind !== "admin") {
+          deny(reply);
+          return reply;
+        }
+      },
+    },
+    async (request, reply) => {
+      if (!Buffer.isBuffer(request.body)) {
+        return reply.code(400).send({ error: "expected a binary image body" });
+      }
+      const query = request.query as { name?: string };
+      try {
+        const upload = stageUpload(uploadsRoot, request.body, query.name);
+        return reply.code(201).send(upload);
+      } catch (error) {
+        if (error instanceof UploadError) {
+          return reply.code(error.status).send({ error: error.message });
+        }
+        throw error;
+      }
+    },
+  );
 
   app.get("/api/tasks", async (request, reply) => {
     const auth = resolveAuth(request, adminToken, tokens);
@@ -180,14 +267,43 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
     if (model && !modelAllowed(model)) {
       return reply.code(400).send({ error: `model not allowed: ${model}` });
     }
+    let uploadIds: string[];
+    try {
+      uploadIds = parseUploadIds(body.uploads);
+    } catch (error) {
+      if (error instanceof UploadError) return reply.code(error.status).send({ error: error.message });
+      throw error;
+    }
+    if (uploadIds.length > 0) {
+      await capabilities.ensureFresh();
+      const effectiveModel = model ?? settings.model;
+      const vision = capabilities.supportsVision(effectiveModel);
+      if (vision === false) {
+        return reply.code(400).send({ error: `model does not support image inputs: ${effectiveModel}` });
+      }
+      if (vision === null) {
+        return reply.code(503).send({ error: "model vision capabilities unavailable; cannot verify vision support" });
+      }
+    }
     if (auth.kind === "task") {
       // A task can only spawn a follow-up turn of its own conversation; body
       // origin/schedule_id/parent fields are ignored.
+      let uploads: Upload[] = [];
+      if (uploadIds.length > 0) {
+        const existing = store.thread(auth.scope.rootId).flatMap((t) => (Array.isArray(t.uploads) ? t.uploads : []));
+        try {
+          uploads = adoptUploads(uploadsRoot, auth.scope.rootId, uploadIds, existing);
+        } catch (error) {
+          if (error instanceof UploadError) return reply.code(error.status).send({ error: error.message });
+          throw error;
+        }
+      }
       const task = runner.create(prompt, {
         parent_id: auth.scope.taskId,
         thread_id: auth.scope.rootId,
         origin: auth.scope.origin,
         model,
+        uploads,
       });
       return reply.code(202).send(publicTask(task));
     }
@@ -202,10 +318,22 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
         return reply.code(404).send({ error: `unknown conversation: ${conversationId}` });
       }
     }
+    const taskId = newId();
+    let uploads: Upload[] = [];
+    if (uploadIds.length > 0) {
+      try {
+        uploads = adoptUploads(uploadsRoot, taskId, uploadIds);
+      } catch (error) {
+        if (error instanceof UploadError) return reply.code(error.status).send({ error: error.message });
+        throw error;
+      }
+    }
     const task = runner.create(prompt, {
+      id: taskId,
       model,
       origin: String(body.origin ?? "web"),
       schedule_id: body.schedule_id ? String(body.schedule_id) : null,
+      uploads,
       ...(conversationId !== null
         ? { inherited_from: conversationId, inherited_tools: registry.snapshotConversation(conversationId) }
         : {}),
@@ -252,6 +380,34 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
       .send(createReadStream(path));
   });
 
+  // Serve one user-uploaded image for a task turn. Auth and headers mirror the
+  // artifact route (conversation-scoped, nosniff, attachment, private cache).
+  app.get("/api/tasks/:taskId/uploads/:uploadId", async (request, reply) => {
+    const auth = resolveAuth(request, adminToken, tokens);
+    if (!auth) return deny(reply);
+    const { taskId, uploadId } = request.params as { taskId: string; uploadId: string };
+    const task = store.get(taskId);
+    if (!task) return notFound(reply);
+    if (auth.kind === "task" && rootId(task) !== auth.scope.rootId) return notFound(reply);
+    const uploads = Array.isArray(task.uploads) ? task.uploads : [];
+    const upload = uploads.find((entry) => entry.id === uploadId);
+    if (!upload) return notFound(reply);
+    const path = uploadPath(uploadsRoot, rootId(task), upload.id);
+    let size: number;
+    try {
+      size = statSync(path).size;
+    } catch {
+      return notFound(reply);
+    }
+    return reply
+      .header("Content-Type", upload.content_type || "application/octet-stream")
+      .header("Content-Length", String(size))
+      .header("Content-Disposition", contentDisposition(upload.name))
+      .header("X-Content-Type-Options", "nosniff")
+      .header("Cache-Control", "private, max-age=3600")
+      .send(createReadStream(path));
+  });
+
   app.delete("/api/tasks/:taskId", async (request, reply) => {
     const auth = resolveAuth(request, adminToken, tokens);
     if (!auth) return deny(reply);
@@ -269,6 +425,11 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
       removeConversationArtifacts(artifactsDir(settings), root);
     } catch (error) {
       console.error(`isidore: artifact cleanup for ${root} failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    try {
+      removeConversationUploads(uploadsRoot, root);
+    } catch (error) {
+      console.error(`isidore: upload cleanup for ${root} failed: ${error instanceof Error ? error.message : String(error)}`);
     }
     // Cascade the conversation's tools: registry records (indexes + version
     // dirs) and its read-only tool-cache copies. Children may hold PINNED
@@ -320,11 +481,39 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
       // An inherited model that is no longer whitelisted falls back to the default.
       model = null;
     }
+    const chosenModel = model ? String(model) : null;
+    let uploadIds: string[];
+    try {
+      uploadIds = parseUploadIds(body.uploads);
+    } catch (error) {
+      if (error instanceof UploadError) return reply.code(error.status).send({ error: error.message });
+      throw error;
+    }
+    let uploads: Upload[] = [];
+    if (uploadIds.length > 0) {
+      await capabilities.ensureFresh();
+      const effectiveModel = chosenModel ?? settings.model;
+      const vision = capabilities.supportsVision(effectiveModel);
+      if (vision === false) {
+        return reply.code(400).send({ error: `model does not support image inputs: ${effectiveModel}` });
+      }
+      if (vision === null) {
+        return reply.code(503).send({ error: "model vision capabilities unavailable; cannot verify vision support" });
+      }
+      const existing = store.thread(rootId(parent)).flatMap((t) => (Array.isArray(t.uploads) ? t.uploads : []));
+      try {
+        uploads = adoptUploads(uploadsRoot, rootId(parent), uploadIds, existing);
+      } catch (error) {
+        if (error instanceof UploadError) return reply.code(error.status).send({ error: error.message });
+        throw error;
+      }
+    }
     const task = runner.create(prompt, {
       parent_id: parent.id,
       thread_id: rootId(parent),
-      model: model ? String(model) : null,
+      model: chosenModel,
       origin: parent.origin,
+      uploads,
     });
     return reply.code(202).send(publicTask(task));
   });
@@ -395,10 +584,11 @@ export async function createApp(settings: Settings): Promise<{ app: FastifyInsta
   });
 
   app.addHook("onClose", async () => {
+    if (!options.capabilities) capabilities.close();
     await bot?.stop();
     await runner.close();
     await scheduler.close();
   });
 
-  return { app, tokens };
+  return { app, tokens, capabilities };
 }

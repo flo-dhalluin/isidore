@@ -42,6 +42,8 @@ interface WorkerRequest {
   apiKey?: string | null;
   /** Tool set composed by the runner at spawn (Phase 2). */
   tools?: ResolvedTool[];
+  /** Uploaded images for this turn (base64 + MIME), delivered via stdin. */
+  images?: Array<{ data: string; mimeType: string }>;
 }
 
 /** Mirror the CLI's JSON-mode transformation: strip cumulative snapshots. */
@@ -226,7 +228,21 @@ async function main(): Promise<number> {
     });
 
     await session.bindExtensions({});
-    await session.prompt(request.prompt);
+
+    const images =
+      Array.isArray(request.images) && request.images.length > 0
+        ? request.images.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }))
+        : undefined;
+    if (images) {
+      const activeModel = session.model ?? model;
+      if (!activeModel || !Array.isArray(activeModel.input) || !activeModel.input.includes("image")) {
+        throw new Error(
+          `Model ${activeModel?.id ?? request.model ?? "(default)"} does not support image inputs`,
+        );
+      }
+    }
+
+    await session.prompt(request.prompt, images ? { images } : undefined);
 
     const messages = session.state.messages;
     const last = messages[messages.length - 1];
