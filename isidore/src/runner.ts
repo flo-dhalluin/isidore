@@ -5,6 +5,7 @@ import { createTask, isDone, rootId, type Task, type TaskStore, utcnow } from ".
 import { stageToolCache } from "./tool-cache.ts";
 import { TokenRegistry } from "./tokens.ts";
 import { builtinManifests, type ResolvedTool, type ToolRegistry } from "./tools.ts";
+import { uploadPath } from "./uploads.ts";
 import { MAX_EVENT_TEXT } from "./limits.ts";
 
 export interface RunnerOptions {
@@ -40,6 +41,13 @@ export interface RunnerOptions {
    * from the registry's env/port instead.
    */
   toolsUrl?: string | null;
+  /** Root of the service-only upload store; defaults to <ISIDORE_STATE ?? /state>/uploads. */
+  uploadsRoot?: string;
+}
+
+export interface WorkerImage {
+  data: string;
+  mimeType: string;
 }
 
 export interface WorkerRequest {
@@ -55,6 +63,8 @@ export interface WorkerRequest {
   apiKey?: string | null;
   /** Resolved tool set composed at spawn (Phase 2); additive, JSONL untouched. */
   tools?: ResolvedTool[];
+  /** Uploaded images for this turn, base64-encoded via stdin; never on disk in workspace. */
+  images?: WorkerImage[];
 }
 
 export function buildWorkerRequest(
@@ -62,8 +72,16 @@ export function buildWorkerRequest(
   model: string | null,
   apiKey: string | null = null,
   tools?: ResolvedTool[],
+  images?: WorkerImage[],
 ): WorkerRequest {
-  return { prompt: task.prompt, model: task.model ?? model, sessionId: rootId(task), apiKey, ...(tools ? { tools } : {}) };
+  return {
+    prompt: task.prompt,
+    model: task.model ?? model,
+    sessionId: rootId(task),
+    apiKey,
+    ...(tools ? { tools } : {}),
+    ...(images && images.length > 0 ? { images } : {}),
+  };
 }
 
 /**
@@ -309,6 +327,7 @@ export class Runner {
   private readonly registry: ToolRegistry | null;
   private readonly toolCacheRoot: string;
   private readonly toolsUrl: string | null;
+  private readonly uploadsRoot: string;
   private readonly procs = new Map<string, ChildProcess>();
   private readonly jobs = new Set<Promise<void>>();
   private active = 0;
@@ -333,6 +352,7 @@ export class Runner {
     this.registry = options.registry ?? null;
     this.toolCacheRoot = options.toolCacheRoot ?? join(this.baseEnv.ISIDORE_STATE ?? "/state", "tool-cache");
     this.toolsUrl = options.toolsUrl ?? this.baseEnv.ISIDORE_TOOLS_URL ?? null;
+    this.uploadsRoot = options.uploadsRoot ?? join(this.baseEnv.ISIDORE_STATE ?? "/state", "uploads");
     this.sweepToolCacheStaging();
     if (this.unsafeNoSandbox) {
       console.error("======================================================================");
@@ -522,7 +542,18 @@ export class Runner {
 
     const resolved = this.resolveTools(task);
     stageToolCache(this.registry, this.toolCacheRoot, rootId(task), resolved);
-    const request = buildWorkerRequest(task, this.model, this.baseEnv.OPENROUTER_API_KEY ?? null, resolved);
+    const uploads = Array.isArray(task.uploads) ? task.uploads : [];
+    const images: WorkerImage[] = uploads.map((upload) => ({
+      data: readFileSync(uploadPath(this.uploadsRoot, rootId(task), upload.id)).toString("base64"),
+      mimeType: upload.content_type,
+    }));
+    const request = buildWorkerRequest(
+      task,
+      this.model,
+      this.baseEnv.OPENROUTER_API_KEY ?? null,
+      resolved,
+      images,
+    );
     // In dev the worker is TypeScript; Node runs it with type stripping.
     const workerArgs = this.workerScript.endsWith(".ts")
       ? ["--experimental-strip-types", this.workerScript]

@@ -30,3 +30,12 @@ export const MAX_ARTIFACT_BYTES = 50 * 1024 * 1024;
 
 /** Maximum files one task turn may publish to the task view. */
 export const MAX_ARTIFACTS_PER_TASK = 32;
+
+/** Maximum size of one uploaded image in bytes (raw binary). */
+export const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
+
+/** Maximum uploaded images attached to a single task turn. */
+export const MAX_UPLOADS_PER_TURN = 4;
+
+/** Staged uploads older than this are swept on startup / staging sweeps. */
+export const UPLOAD_STAGING_TTL_MS = 60 * 60 * 1000;

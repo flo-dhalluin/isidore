@@ -27,6 +27,17 @@ export interface Artifact {
   created_at: string;
 }
 
+/** An image uploaded by the user as part of a prompt turn. */
+export interface Upload {
+  /** "u_"+12hex; also the filename in the service-only upload store. */
+  id: string;
+  /** Suggested filename (sanitized). */
+  name: string;
+  size: number;
+  content_type: string;
+  created_at: string;
+}
+
 export const TERMINAL_STATUSES: ReadonlySet<Status> = new Set([
   "succeeded",
   "failed",
@@ -62,6 +73,8 @@ export interface Task {
   tool_calls: ToolCall[];
   /** Files published with the files MCP (send_file), newest last. */
   artifacts: Artifact[];
+  /** Images uploaded by the user for this turn, newest last. */
+  uploads: Upload[];
 }
 
 export type PublicTask = Task & { done: boolean };
@@ -111,6 +124,7 @@ export function createTask(prompt: string, overrides: Partial<Task> = {}): Task 
     workspace: null,
     tool_calls: [],
     artifacts: [],
+    uploads: [],
     ...overrides,
   };
 }
@@ -135,6 +149,7 @@ const KNOWN_FIELDS: ReadonlySet<string> = new Set([
   "workspace",
   "tool_calls",
   "artifacts",
+  "uploads",
 ]);
 
 function fromDict(data: Record<string, unknown>): Task {
@@ -146,6 +161,7 @@ function fromDict(data: Record<string, unknown>): Task {
   // Tolerate a hand-edited/corrupt record without letting it break the API or
   // the artifact writer (both assume an array).
   if (!Array.isArray(task.artifacts)) task.artifacts = [];
+  if (!Array.isArray(task.uploads)) task.uploads = [];
   if (!Array.isArray(task.tool_calls)) task.tool_calls = [];
   return task;
 }

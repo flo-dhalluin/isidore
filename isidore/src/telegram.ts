@@ -1,9 +1,13 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { MAX_UPLOAD_BYTES, MAX_UPLOADS_PER_TURN } from "./limits.ts";
+import type { ModelCapabilities } from "./model-capabilities.ts";
 import type { Runner } from "./runner.ts";
-import { isDone, rootId, type Task, type TaskStore } from "./store.ts";
+
 import { readTemplateAsset } from "./templates.ts";
+import { isDone, newId, rootId, type Task, type TaskStore } from "./store.ts";
 import { approvePromotion } from "./tools-api.ts";
 import type { ToolRegistry } from "./tools.ts";
+import { UploadError, adoptUploads, removeStagedUpload, stageUpload } from "./uploads.ts";
 
 const TASK_ID = /\bt_[0-9a-f]{12}\b/;
 const MAX_MESSAGE = 3_800; // Telegram's hard limit is 4096; leave room for a header.
@@ -162,6 +166,50 @@ export interface TelegramOptions {
   webhookSecret?: string | null;
   /** Tool registry for /tools and /approve (Phase 4); unset disables them. */
   registry?: ToolRegistry;
+  /** Service-only upload store root; enables photo/image-document handling. */
+  uploadsRoot?: string;
+  /** Model capability lookup for vision gating. */
+  capabilities?: ModelCapabilities;
+  /** Default model id used when a task has no explicit model. */
+  defaultModel?: string | null;
+  /** Debounce window in ms for grouping media_group_id albums. */
+  albumDebounceMs?: number;
+}
+
+interface ImageItem {
+  fileId: string;
+  fileName?: string;
+  knownSize?: number;
+}
+
+interface AlbumBuffer {
+  chatId: string;
+  items: ImageItem[];
+  caption: string;
+  replyTo: Record<string, unknown> | null;
+  tooLarge: boolean;
+  timer: NodeJS.Timeout;
+}
+
+function selectPhotoSize(photos: unknown[]): ImageItem | { tooLarge: true } | null {
+  const valid: Array<{ fileId: string; fileSize?: number; area: number }> = [];
+  let sawAny = false;
+  for (const entry of photos) {
+    if (!entry || typeof entry !== "object") continue;
+    const p = entry as Record<string, unknown>;
+    if (typeof p.file_id !== "string" || !p.file_id) continue;
+    sawAny = true;
+    const fileSize = typeof p.file_size === "number" ? p.file_size : undefined;
+    if (fileSize !== undefined && fileSize > MAX_UPLOAD_BYTES) continue;
+    const w = typeof p.width === "number" ? p.width : 0;
+    const h = typeof p.height === "number" ? p.height : 0;
+    valid.push({ fileId: p.file_id, fileSize, area: w * h });
+  }
+  if (!sawAny) return null;
+  if (!valid.length) return { tooLarge: true };
+  valid.sort((a, b) => (a.fileSize ?? a.area) - (b.fileSize ?? b.area));
+  const best = valid[valid.length - 1];
+  return { fileId: best.fileId, knownSize: best.fileSize };
 }
 
 /** Derive a webhook secret from the bot token: [A-Za-z0-9_-], stable across restarts. */
@@ -180,6 +228,10 @@ export class TelegramBot {
   private readonly store: TaskStore;
   private readonly allowedChats: Set<string>;
   private readonly registry: ToolRegistry | null;
+  private readonly uploadsRoot: string | null;
+  private readonly capabilities: ModelCapabilities | null;
+  private readonly defaultModel: string | null;
+  private readonly albumDebounceMs: number;
   private readonly apiBase: string;
   private readonly pollTimeout: number;
   readonly webhookUrl: string | null;
@@ -189,6 +241,7 @@ export class TelegramBot {
   private readonly notified = new Set<string>();
   /** Telegram file_id of the logo, so it is uploaded only once per process. */
   private logoFileId: string | null = null;
+  private readonly albums = new Map<string, AlbumBuffer>();
   private offset = 0;
   private stopped = false;
 
@@ -199,6 +252,10 @@ export class TelegramBot {
     this.store = store;
     this.allowedChats = allowedChats;
     this.registry = options.registry ?? null;
+    this.uploadsRoot = options.uploadsRoot ?? null;
+    this.capabilities = options.capabilities ?? null;
+    this.defaultModel = options.defaultModel ?? null;
+    this.albumDebounceMs = options.albumDebounceMs ?? 400;
     this.apiBase = (options.apiBase ?? "https://api.telegram.org").replace(/\/+$/, "");
     this.pollTimeout = options.pollTimeout ?? 30;
     this.webhookUrl = options.webhookUrl || null;
@@ -276,6 +333,8 @@ export class TelegramBot {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    for (const album of this.albums.values()) clearTimeout(album.timer);
+    this.albums.clear();
   }
 
   private async getUpdates(): Promise<Array<Record<string, unknown>>> {
@@ -358,9 +417,33 @@ export class TelegramBot {
     const message = (update.message ?? {}) as Record<string, unknown>;
     const chat = (message.chat ?? {}) as Record<string, unknown>;
     const chatId = String(chat.id ?? "");
-    const text = String(message.text ?? "").trim();
-    if (!chatId || !text) return;
+    if (!chatId) return;
     if (!this.allowedChats.has(chatId)) return;
+
+    const imageItem = this.extractImageItem(message);
+    if (imageItem) {
+      if ("tooLarge" in imageItem) {
+        const mediaGroupId = typeof message.media_group_id === "string" ? message.media_group_id : null;
+        if (mediaGroupId) {
+          this.bufferAlbumTooLarge(chatId, mediaGroupId);
+        } else {
+          await this.send(chatId, "Image exceeds the 8 MB limit.");
+        }
+        return;
+      }
+      const caption = String(message.caption ?? "").trim();
+      const replyTo = (message.reply_to_message ?? null) as Record<string, unknown> | null;
+      const mediaGroupId = typeof message.media_group_id === "string" ? message.media_group_id : null;
+      if (mediaGroupId) {
+        this.bufferAlbumItem(chatId, mediaGroupId, imageItem, caption, replyTo);
+        return;
+      }
+      await this.handleImageTurn(chatId, [imageItem], caption, replyTo);
+      return;
+    }
+
+    const text = String(message.text ?? "").trim();
+    if (!text) return;
 
     const [rawCommand, ...restParts] = text.split(" ");
     const command = rawCommand.split("@")[0].toLowerCase();
@@ -369,9 +452,7 @@ export class TelegramBot {
     // A reply to one of this bot's task messages continues that conversation.
     const replyTo = (message.reply_to_message ?? null) as Record<string, unknown> | null;
     if (replyTo && !command.startsWith("/")) {
-      const from = (replyTo.from ?? {}) as Record<string, unknown>;
-      const taskId = String(replyTo.text ?? "").match(TASK_ID)?.[0];
-      const task = taskId && String(from.id ?? "") === this.botId ? this.store.get(taskId) : null;
+      const task = this.resolveReplyTask(replyTo);
       if (task) {
         await this.followup(chatId, task, text);
         return;
@@ -392,6 +473,239 @@ export class TelegramBot {
     else if (command === "/approve") await this.approve(chatId, rest);
     else if (command.startsWith("/")) await this.send(chatId, `Unknown command ${command}. Try /help.`);
     else await this.create(chatId, text);
+  }
+
+  private resolveReplyTask(replyTo: Record<string, unknown> | null): Task | null {
+    if (!replyTo) return null;
+    const from = (replyTo.from ?? {}) as Record<string, unknown>;
+    const replyText = String(replyTo.text ?? replyTo.caption ?? "");
+    const taskId = replyText.match(TASK_ID)?.[0];
+    return taskId && String(from.id ?? "") === this.botId ? (this.store.get(taskId) ?? null) : null;
+  }
+
+  private extractImageItem(message: Record<string, unknown>): ImageItem | { tooLarge: true } | null {
+    if (Array.isArray(message.photo) && message.photo.length > 0) {
+      return selectPhotoSize(message.photo);
+    }
+    const doc = message.document && typeof message.document === "object"
+      ? (message.document as Record<string, unknown>)
+      : null;
+    if (!doc) return null;
+    const mime = typeof doc.mime_type === "string" ? doc.mime_type.toLowerCase() : "";
+    const fileName = typeof doc.file_name === "string" ? doc.file_name : undefined;
+    const isImage = mime.startsWith("image/") || (fileName !== undefined && /\.(png|jpe?g|gif|webp)$/i.test(fileName));
+    if (!isImage) return null;
+    const fileId = typeof doc.file_id === "string" ? doc.file_id : "";
+    if (!fileId) return null;
+    const knownSize = typeof doc.file_size === "number" ? doc.file_size : undefined;
+    if (knownSize !== undefined && knownSize > MAX_UPLOAD_BYTES) return { tooLarge: true };
+    return { fileId, fileName, knownSize };
+  }
+
+  private bufferAlbumTooLarge(chatId: string, mediaGroupId: string): void {
+    const key = `${chatId}:${mediaGroupId}`;
+    const existing = this.albums.get(key);
+    if (existing) {
+      clearTimeout(existing.timer);
+      existing.tooLarge = true;
+      existing.timer = setTimeout(() => void this.flushAlbum(key).catch(() => {}), this.albumDebounceMs);
+      return;
+    }
+    const timer = setTimeout(() => void this.flushAlbum(key).catch(() => {}), this.albumDebounceMs);
+    this.albums.set(key, { chatId, items: [], caption: "", replyTo: null, tooLarge: true, timer });
+  }
+
+  private bufferAlbumItem(
+    chatId: string,
+    mediaGroupId: string,
+    item: ImageItem,
+    caption: string,
+    replyTo: Record<string, unknown> | null,
+  ): void {
+    const key = `${chatId}:${mediaGroupId}`;
+    const existing = this.albums.get(key);
+    if (existing) {
+      clearTimeout(existing.timer);
+      existing.items.push(item);
+      if (!existing.caption && caption) existing.caption = caption;
+      if (!existing.replyTo && replyTo) existing.replyTo = replyTo;
+      existing.timer = setTimeout(() => void this.flushAlbum(key).catch(() => {}), this.albumDebounceMs);
+      return;
+    }
+    const timer = setTimeout(() => void this.flushAlbum(key).catch(() => {}), this.albumDebounceMs);
+    this.albums.set(key, { chatId, items: [item], caption, replyTo, tooLarge: false, timer });
+  }
+
+  private async flushAlbum(key: string): Promise<void> {
+    const album = this.albums.get(key);
+    if (!album) return;
+    this.albums.delete(key);
+    if (this.stopped) return;
+    if (album.tooLarge) {
+      await this.send(album.chatId, "One or more images in the album exceed the 8 MB limit.");
+      return;
+    }
+    await this.handleImageTurn(album.chatId, album.items, album.caption, album.replyTo);
+  }
+
+  /**
+   * Download one Telegram file via getFile + file endpoint while enforcing
+   * MAX_UPLOAD_BYTES. Secret hygiene: never log or embed the token-bearing URL.
+   */
+  private async downloadFile(fileId: string): Promise<{ buffer: Buffer; suggestedName?: string }> {
+    const info = (await this.call("getFile", { file_id: fileId })) as {
+      file_path?: unknown;
+      file_size?: unknown;
+    } | null;
+    const filePath = typeof info?.file_path === "string" ? info.file_path.replace(/^\/+/, "") : "";
+    if (!filePath) throw new Error("Telegram getFile returned no file_path");
+    if (typeof info?.file_size === "number" && info.file_size > MAX_UPLOAD_BYTES) {
+      throw new UploadError(413, "Image exceeds the 8 MB limit.");
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30_000);
+    timer.unref?.();
+    let response: Response;
+    try {
+      response = await fetch(`${this.apiBase}/file/bot${this.token}/${filePath}`, {
+        signal: controller.signal,
+      });
+    } catch {
+      clearTimeout(timer);
+      throw new Error("Telegram file download failed");
+    }
+
+    try {
+      if (!response.ok) {
+        throw new Error(`Telegram file download failed (HTTP ${response.status})`);
+      }
+      const clHeader = response.headers.get("content-length");
+      if (clHeader) {
+        const cl = Number.parseInt(clHeader, 10);
+        if (Number.isFinite(cl) && cl > MAX_UPLOAD_BYTES) {
+          controller.abort();
+          throw new UploadError(413, "Image exceeds the 8 MB limit.");
+        }
+      }
+      const chunks: Buffer[] = [];
+      let total = 0;
+      if (response.body) {
+        for await (const chunk of response.body as AsyncIterable<Uint8Array>) {
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          total += buf.byteLength;
+          if (total > MAX_UPLOAD_BYTES) {
+            controller.abort();
+            throw new UploadError(413, "Image exceeds the 8 MB limit.");
+          }
+          chunks.push(buf);
+        }
+      }
+      const buffer = Buffer.concat(chunks);
+      const suggestedName = filePath.split("/").pop() || undefined;
+      return { buffer, suggestedName };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async handleImageTurn(
+    chatId: string,
+    items: ImageItem[],
+    caption: string,
+    replyTo: Record<string, unknown> | null,
+  ): Promise<void> {
+    if (items.length > MAX_UPLOADS_PER_TURN) {
+      await this.send(chatId, `Too many images (max ${MAX_UPLOADS_PER_TURN} per turn).`);
+      return;
+    }
+    if (!this.uploadsRoot || !this.capabilities) {
+      await this.send(chatId, "Image uploads are not configured.");
+      return;
+    }
+
+    const replyTask = this.resolveReplyTask(replyTo);
+    let parent: Task | null = null;
+    if (replyTask) {
+      const root = rootId(replyTask);
+      const turns = this.store.thread(root);
+      const running = turns.find((turn) => !isDone(turn));
+      if (running) {
+        await this.send(chatId, `${running.id} is still running; wait for it or /cancel ${running.id}.`);
+        return;
+      }
+      parent = turns[turns.length - 1] ?? replyTask;
+    }
+
+    const effectiveModel = parent?.model ?? this.defaultModel;
+    await this.capabilities.ensureFresh();
+    const vision = this.capabilities.supportsVision(effectiveModel);
+    if (vision === false) {
+      await this.send(
+        chatId,
+        `Model ${effectiveModel ?? "(default)"} does not support images. Switch to a vision-capable model or send a text message.`,
+      );
+      return;
+    }
+    if (vision === null) {
+      await this.send(
+        chatId,
+        `Cannot verify image support for ${effectiveModel ?? "(default)"} right now (model capabilities unavailable). Please try again later.`,
+      );
+      return;
+    }
+
+    const stagedIds: string[] = [];
+    try {
+      for (const item of items) {
+        const { buffer, suggestedName } = await this.downloadFile(item.fileId);
+        const staged = stageUpload(this.uploadsRoot, buffer, item.fileName ?? suggestedName);
+        stagedIds.push(staged.id);
+      }
+    } catch (error) {
+      for (const id of stagedIds) removeStagedUpload(this.uploadsRoot, id);
+      const message = error instanceof UploadError ? error.message : "Failed to download image from Telegram.";
+      await this.send(chatId, message);
+      return;
+    }
+
+    const prompt = caption || "Describe the attached image(s).";
+    if (parent) {
+      const root = rootId(parent);
+      const turns = this.store.thread(root);
+      const running = turns.find((turn) => !isDone(turn));
+      if (running) {
+        for (const id of stagedIds) removeStagedUpload(this.uploadsRoot, id);
+        await this.send(chatId, `${running.id} is still running; wait for it or /cancel ${running.id}.`);
+        return;
+      }
+      const existing = turns.flatMap((t) => (Array.isArray(t.uploads) ? t.uploads : []));
+      const uploads = adoptUploads(this.uploadsRoot, root, stagedIds, existing);
+      const next = this.runner.create(prompt, {
+        parent_id: parent.id,
+        thread_id: root,
+        model: parent.model,
+        origin: `telegram:${chatId}`,
+        uploads,
+      });
+      await this.send(
+        chatId,
+        `Queued ${next.id} (follow-up of ${root}, ${uploads.length} image${uploads.length === 1 ? "" : "s"})\n${prompt.slice(0, 500)}`,
+      );
+      return;
+    }
+
+    const taskId = newId();
+    const uploads = adoptUploads(this.uploadsRoot, taskId, stagedIds);
+    const task = this.runner.create(prompt, {
+      id: taskId,
+      origin: `telegram:${chatId}`,
+      uploads,
+    });
+    await this.send(
+      chatId,
+      `Queued ${task.id} (${uploads.length} image${uploads.length === 1 ? "" : "s"})\n${prompt.slice(0, 500)}`,
+    );
   }
 
   private async create(chatId: string, prompt: string): Promise<void> {

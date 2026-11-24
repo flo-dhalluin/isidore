@@ -59,15 +59,17 @@ REST API:
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/info` | feature flags (scheduler, telegram, model, model whitelist) |
+| `GET` | `/api/info` | feature flags (scheduler, telegram, model, model whitelist, `vision_models`) |
 | `GET` | `/api/auth/whoami` | caller identity: `{admin:true}` or `{task_id, root_id, origin}` |
+| `POST` | `/api/uploads?name=` | upload a binary image (PNG/JPEG/GIF/WebP, ≤8 MiB, admin-only) → 201 |
 | `GET` | `/api/tasks?limit=50&status=running` | list tasks |
-| `POST` | `/api/tasks` | `{prompt, model?, origin?, schedule_id?}` → 202 (model must be whitelisted) |
+| `POST` | `/api/tasks` | `{prompt, model?, uploads?, origin?, schedule_id?}` → 202 (model must be whitelisted; vision-gated when `uploads` present) |
 | `GET` | `/api/tasks/{id}` | one task, including output |
 | `GET` | `/api/tasks/{id}/artifacts/{artifactId}` | download a file published with `send_file` |
-| `DELETE` | `/api/tasks/{id}` | delete a finished conversation + workspace |
+| `GET` | `/api/tasks/{id}/uploads/{uploadId}` | download a user-uploaded image attached to a turn |
+| `DELETE` | `/api/tasks/{id}` | delete a finished conversation + workspace + uploads |
 | `GET` | `/api/tasks/{id}/thread` | every turn of a conversation, oldest first |
-| `POST` | `/api/tasks/{id}/followup` | `{prompt, model?}` → 202, continues the conversation |
+| `POST` | `/api/tasks/{id}/followup` | `{prompt, model?, uploads?}` → 202, continues the conversation |
 | `POST` | `/api/tasks/{id}/cancel` | cancel a queued/running task |
 | `GET` | `/api/schedules` | proxy to the scheduler |
 | `POST` | `/api/schedules` | `{prompt, at?, every?, model?}` |
@@ -172,6 +174,42 @@ token scoped to that conversation) and are always
 `Content-Disposition: attachment` with `X-Content-Type-Options: nosniff`, so
 agent-authored HTML/SVG cannot execute in the UI's origin. Limits: 50 MB per
 file, 32 files per turn.
+
+### Images
+
+Users can attach raster images from the web UI (file picker, drag-and-drop onto
+the prompt, or clipboard paste), the JSON API, or Telegram (photos, image
+documents, and `media_group_id` albums).
+
+1. `POST /api/uploads?name=<filename>` (admin-only, binary body, per-route
+   `bodyLimit` of 8 MiB) validates magic bytes and stages the image in
+   `<stateDir>/uploads/_staging/<uploadId>` (1 h staging TTL, swept at startup).
+   Supported formats: **PNG, JPEG, GIF, WebP** (never trusts declared
+   `Content-Type`; SVG is rejected).
+2. `POST /api/tasks` and `POST /api/tasks/{id}/followup` accept
+   `uploads: string[]` (up to **4 images per turn**). Staged uploads are
+   atomically moved into `<stateDir>/uploads/<root>/<uploadId>` (service-only,
+   never Landlock-allow-listed); the runner base64-encodes them into the
+   worker's stdin JSON request (`WorkerRequest.images`), and the Pi SDK handles
+   resizing and format handling.
+3. **Model gating**: `src/model-capabilities.ts` fetches OpenRouter's public
+   `GET https://openrouter.ai/api/v1/models` catalog at startup (no API key,
+   ~1 h lazy TTL, keeps stale cache on refresh error) and inspects
+   `architecture.input_modalities` (stripping `openrouter/` with a `~` alias
+   fallback for entries like `~deepseek/deepseek-flash-latest`). `/api/info`
+   exposes `vision_models`; uploads against a known text-only model return
+   `400`, and unknown/unavailable capabilities fail closed with `503`. The
+   worker also double-checks `model.input.includes("image")` before prompting.
+4. Uploaded images render as thumbnails in the "you" section of the task view,
+   served from `GET /api/tasks/{id}/uploads/{uploadId}` with the same auth and
+   `nosniff` + attachment headers as artifacts. Deleting a conversation removes
+   its uploads.
+
+Caveats:
+- **Model switching mid-conversation**: Pi persists images in the per-workspace
+  session JSONL and does not rewrite history; switching a conversation with
+  image history to a text-only model may fail at the provider (the UI warns).
+- Schedules stay text-only (`POST /api/tasks` from the scheduler is unchanged).
 
 ### Promotion (human-gated)
 

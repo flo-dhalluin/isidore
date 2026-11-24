@@ -4,10 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createApp } from "../src/server.ts";
-import { tasksDir, toolCacheDir, toolsDir, workspacesDir, type Settings } from "../src/config.ts";
+import { tasksDir, toolCacheDir, toolsDir, uploadsDir, workspacesDir, type Settings } from "../src/config.ts";
+import { MAX_UPLOAD_BYTES } from "../src/limits.ts";
+import { ModelCapabilities } from "../src/model-capabilities.ts";
 import { DEFAULT_MODEL, MODEL_WHITELIST } from "../src/models.ts";
 import { TaskStore, createTask, utcnow } from "../src/store.ts";
 import { ToolRegistry, type ToolInput } from "../src/tools.ts";
+import { uploadPath, uploadStagingDir } from "../src/uploads.ts";
 
 const ADMIN = "test-token";
 const adminAuth = { authorization: `Bearer ${ADMIN}` };
@@ -76,6 +79,9 @@ test("serves the UI, API and runs a task end to end", async () => {
     assert.match(index.body, /id="tools-link" href="\/tools"/);
     // Artifacts published with send_file are surfaced in the task list.
     assert.match(index.body, /fileCount/);
+    // Image upload UI controls are wired up in index.html.
+    assert.match(index.body, /id="attach-btn"/);
+    assert.match(index.body, /vision_models/);
     // The logo doubles as the favicon; the asset is public (no token needed).
     assert.match(index.body, /<link rel="icon" type="image\/svg\+xml" href="\/loutre-tete.svg">/);
     assert.match(index.body, /<img class="logo" src="\/loutre-tete.svg"/);
@@ -95,6 +101,9 @@ test("serves the UI, API and runs a task end to end", async () => {
     assert.match(taskPage.body, /id="model-select"/);
     // The task page renders the download links for published artifacts.
     assert.match(taskPage.body, /artifactList/);
+    // The task page renders uploaded image thumbnails and attach controls.
+    assert.match(taskPage.body, /uploadList/);
+    assert.match(taskPage.body, /id="attach-btn"/);
 
     const toolsPage = await app.inject({ method: "GET", url: "/tools", headers: adminAuth });
     assert.equal(toolsPage.statusCode, 200);
@@ -668,6 +677,237 @@ test("schedules proxy rejects a model outside the whitelist", async () => {
       payload: { prompt: "hi", every: "1h", model: "model-b" },
     });
     assert.equal(response.statusCode, 400);
+  } finally {
+    await app.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+const PNG_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00]);
+
+function mockedCapabilities(entries: Array<{ id: string; modalities: string[] }> | "fail"): ModelCapabilities {
+  return new ModelCapabilities({
+    retryCooldownMs: 0,
+    fetchFn: (async () => {
+      if (entries === "fail") return new Response("down", { status: 503 });
+      return new Response(
+        JSON.stringify({
+          data: entries.map((e) => ({ id: e.id, architecture: { input_modalities: e.modalities } })),
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch,
+  });
+}
+
+test("image uploads: auth, validation, vision gating, serving headers, scoping, and delete cleanup", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "isidore-server-"));
+  const settings = settingsFor(dir);
+  settings.models = ["openrouter/vision/m", "openrouter/text/m", "openrouter/unknown/m"];
+  settings.model = "openrouter/vision/m";
+  writeFileSync(settings.workerScript, "#!/bin/sh\ncat > request.json\nprintf 'ok\\n'\n");
+
+  const caps = mockedCapabilities([
+    { id: "vision/m", modalities: ["text", "image"] },
+    { id: "text/m", modalities: ["text"] },
+  ]);
+  await caps.refresh();
+
+  const { app, tokens } = await createApp(settings, { capabilities: caps });
+  try {
+    // 1. /api/info exposes vision_models (additive).
+    const info = await app.inject({ method: "GET", url: "/api/info", headers: adminAuth });
+    assert.equal(info.statusCode, 200);
+    assert.deepEqual(info.json().vision_models, ["openrouter/vision/m"]);
+
+    // 2. Upload auth: no token => 401; task token => 401 (admin-only).
+    assert.equal(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/uploads",
+          headers: { "content-type": "image/png" },
+          payload: PNG_BYTES,
+        })
+      ).statusCode,
+      401,
+    );
+    const dummy = await makeTask(app, "seed");
+    const taskToken = tokens.issue(dummy);
+    assert.equal(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/uploads",
+          headers: { ...bearer(taskToken), "content-type": "image/png" },
+          payload: PNG_BYTES,
+        })
+      ).statusCode,
+      401,
+    );
+
+    // 3. Oversize => 413.
+    const tooBig = Buffer.concat([PNG_BYTES, Buffer.alloc(MAX_UPLOAD_BYTES + 1 - PNG_BYTES.length)]);
+    const oversize = await app.inject({
+      method: "POST",
+      url: "/api/uploads",
+      headers: { ...adminAuth, "content-type": "image/png" },
+      payload: tooBig,
+    });
+    assert.equal(oversize.statusCode, 413);
+
+    // 4. Disguised SVG => 400.
+    const disguisedSvg = await app.inject({
+      method: "POST",
+      url: "/api/uploads?name=evil.png",
+      headers: { ...adminAuth, "content-type": "image/png" },
+      payload: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>'),
+    });
+    assert.equal(disguisedSvg.statusCode, 400);
+
+    // 5. Valid upload stages file and returns Upload metadata.
+    const upRes = await app.inject({
+      method: "POST",
+      url: "/api/uploads?name=cat.png",
+      headers: { ...adminAuth, "content-type": "image/png" },
+      payload: PNG_BYTES,
+    });
+    assert.equal(upRes.statusCode, 201);
+    const upload = upRes.json();
+    assert.match(upload.id, /^u_[0-9a-f]{12}$/);
+    assert.equal(upload.name, "cat.png");
+    assert.equal(upload.content_type, "image/png");
+    assert.equal(upload.size, PNG_BYTES.byteLength);
+    assert.ok(existsSync(join(uploadStagingDir(uploadsDir(settings)), upload.id)));
+
+    // 6. Non-vision model => 400 (staged upload remains staged).
+    const nonVision = await app.inject({
+      method: "POST",
+      url: "/api/tasks",
+      headers: adminAuth,
+      payload: { prompt: "look", model: "openrouter/text/m", uploads: [upload.id] },
+    });
+    assert.equal(nonVision.statusCode, 400);
+    assert.ok(existsSync(join(uploadStagingDir(uploadsDir(settings)), upload.id)));
+
+    // 7. Unknown model capability => 503 (fail closed).
+    const unknownModel = await app.inject({
+      method: "POST",
+      url: "/api/tasks",
+      headers: adminAuth,
+      payload: { prompt: "look", model: "openrouter/unknown/m", uploads: [upload.id] },
+    });
+    assert.equal(unknownModel.statusCode, 503);
+
+    // 8. Vision-capable model => 202, moves from staging, worker receives base64 on stdin.
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/tasks",
+      headers: adminAuth,
+      payload: { prompt: "describe", model: "openrouter/vision/m", uploads: [upload.id] },
+    });
+    assert.equal(created.statusCode, 202);
+    const task = await waitForTerminal(app, created.json().id);
+    assert.equal(task.uploads.length, 1);
+    assert.equal(task.uploads[0].id, upload.id);
+    assert.ok(!existsSync(join(uploadStagingDir(uploadsDir(settings)), upload.id)));
+    assert.ok(existsSync(uploadPath(uploadsDir(settings), task.id, upload.id)));
+
+    const req = JSON.parse(readFileSync(join(task.workspace, "request.json"), "utf8"));
+    assert.deepEqual(req.images, [{ data: PNG_BYTES.toString("base64"), mimeType: "image/png" }]);
+
+    // 9. Serving route: auth, headers, and conversation scoping.
+    assert.equal(
+      (await app.inject({ method: "GET", url: `/api/tasks/${task.id}/uploads/${upload.id}` })).statusCode,
+      401,
+    );
+    // Other conversation's task token gets 404.
+    assert.equal(
+      (await app.inject({ method: "GET", url: `/api/tasks/${task.id}/uploads/${upload.id}`, headers: bearer(taskToken) }))
+        .statusCode,
+      404,
+    );
+    const served = await app.inject({
+      method: "GET",
+      url: `/api/tasks/${task.id}/uploads/${upload.id}`,
+      headers: adminAuth,
+    });
+    assert.equal(served.statusCode, 200);
+    assert.equal(served.headers["content-type"], "image/png");
+    assert.equal(served.headers["x-content-type-options"], "nosniff");
+    assert.match(String(served.headers["content-disposition"]), /^attachment;/);
+    assert.match(String(served.headers["cache-control"]), /private/);
+    assert.deepEqual(served.rawPayload, PNG_BYTES);
+
+    // 10. Followup with new upload + vision gating + cross-conversation reuse refused.
+    const upRes2 = await app.inject({
+      method: "POST",
+      url: "/api/uploads?name=second.png",
+      headers: { ...adminAuth, "content-type": "image/png" },
+      payload: PNG_BYTES,
+    });
+    const upload2 = upRes2.json();
+
+    const badFollowup = await app.inject({
+      method: "POST",
+      url: `/api/tasks/${task.id}/followup`,
+      headers: adminAuth,
+      payload: { prompt: "nope", model: "openrouter/text/m", uploads: [upload2.id] },
+    });
+    assert.equal(badFollowup.statusCode, 400);
+
+    // Cross-conversation upload ID refused on dummy's followup.
+    const crossFollowup = await app.inject({
+      method: "POST",
+      url: `/api/tasks/${dummy.id}/followup`,
+      headers: adminAuth,
+      payload: { prompt: "steal", model: "openrouter/vision/m", uploads: [upload.id] },
+    });
+    assert.equal(crossFollowup.statusCode, 400);
+
+    const goodFollowup = await app.inject({
+      method: "POST",
+      url: `/api/tasks/${task.id}/followup`,
+      headers: adminAuth,
+      payload: { prompt: "follow", uploads: [upload2.id] },
+    });
+    assert.equal(goodFollowup.statusCode, 202);
+    const followTask = await waitForTerminal(app, goodFollowup.json().id);
+    assert.equal(followTask.uploads.length, 1);
+    assert.equal(followTask.uploads[0].id, upload2.id);
+
+    // 11. Deleting the conversation deletes its uploads directory.
+    const del = await app.inject({ method: "DELETE", url: `/api/tasks/${task.id}`, headers: adminAuth });
+    assert.equal(del.statusCode, 204);
+    assert.ok(!existsSync(join(uploadsDir(settings), task.id)));
+  } finally {
+    await app.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("image uploads fail closed with 503 when OpenRouter capabilities were never fetched", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "isidore-server-"));
+  const settings = settingsFor(dir);
+  const caps = mockedCapabilities("fail");
+  const { app } = await createApp(settings, { capabilities: caps });
+  try {
+    const upRes = await app.inject({
+      method: "POST",
+      url: "/api/uploads?name=cat.png",
+      headers: { ...adminAuth, "content-type": "image/png" },
+      payload: PNG_BYTES,
+    });
+    assert.equal(upRes.statusCode, 201);
+    const upload = upRes.json();
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/tasks",
+      headers: adminAuth,
+      payload: { prompt: "look", uploads: [upload.id] },
+    });
+    assert.equal(created.statusCode, 503);
   } finally {
     await app.close();
     rmSync(dir, { recursive: true, force: true });
