@@ -56,6 +56,30 @@ bind-mounted state stays writable:
 export PI_UID=$(id -u) PI_GID=$(id -g)
 ```
 
+## Prebuilt images (GHCR)
+
+CI builds and publishes the three service images to the GitHub Container
+Registry (`.github/workflows/images.yml`). To run the published images instead
+of building locally, layer `compose.images.yaml` on top of `compose.yaml`:
+
+```sh
+docker compose -f compose.yaml -f compose.images.yaml pull
+docker compose -f compose.yaml -f compose.images.yaml up -d
+```
+
+`compose.images.yaml` only overrides each service's `image:` (and pins
+`pull_policy: always`), so the hardening, secrets, volumes and wiring in
+`compose.yaml` still apply. Pick a tag with `ISIDORE_IMAGE_TAG` (default
+`latest`; CI also pushes `main`, `sha-<short>` and, for `v*` tags, the semver
+tags) or a different registry with `ISIDORE_IMAGE_REGISTRY`:
+
+```sh
+ISIDORE_IMAGE_TAG=v1.2.3 docker compose -f compose.yaml -f compose.images.yaml up -d
+```
+
+The images are `ghcr.io/<owner>/isidore`, `ghcr.io/<owner>/isidore-browser` and
+`ghcr.io/<owner>/isidore-scheduler`.
+
 ## Configuration
 
 Compose reads these from the environment (or a `.env` file beside
@@ -65,7 +89,6 @@ Compose reads these from the environment (or a `.env` file beside
 |---|---|---|
 | `PI_SANDBOX_KEY_FILE` | `/dev/null` | file holding the OpenRouter key (compose secret) |
 | `PI_UID` / `PI_GID` | `1000` / `1000` | uid/gid the services run as |
-| `PI_VERSION` | `latest` | `@earendil-works/pi-coding-agent` version baked into the images |
 | `PI_WEB_PACKAGE` | `pi-web-access` | Pi npm package pre-installed into the images |
 | `PI_SANDBOX_MODEL` | built-in default | default model override; must be in the built-in whitelist (`isidore/src/models.ts`) |
 | `ISIDORE_STATE` | `~/.local/state/pi-sandbox/isidore` | tasks, workspaces, shared Pi config |
@@ -349,8 +372,9 @@ admin API and semantics.
 
 ## Notes
 
-- To change the Pi or `pi-web-access` version, set `PI_VERSION` /
-  `PI_WEB_PACKAGE` and rebuild (`docker compose build`). `pi update` inside the
-  container is pointless (read-only rootfs).
+- The Pi SDK version is pinned by `isidore/package-lock.json`; to change it, bump
+  the dependency there and rebuild (`docker compose build`). `pi-web-access` is
+  set with `PI_WEB_PACKAGE`. `pi update` inside the container is pointless
+  (read-only rootfs).
 - The web UI and API are bound to loopback; put a reverse proxy in front for
   remote access.

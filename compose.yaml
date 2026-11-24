@@ -42,10 +42,9 @@ services:
     build:
       context: isidore
       args:
-        PI_VERSION: ${PI_VERSION:-latest}
         PI_WEB_PACKAGE: ${PI_WEB_PACKAGE:-pi-web-access}
         ISIDORE_SOURCE: ${ISIDORE_SOURCE:-unknown}
-    image: pi-sandbox-isidore:${PI_VERSION:-latest}
+    image: pi-sandbox-isidore
     hostname: isidore
     user: ${PI_UID:-1000}:${PI_GID:-1000}
     pids_limit: ${PI_SANDBOX_PIDS:-512}

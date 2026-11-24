@@ -1,0 +1,30 @@
+# compose.images.yaml — run the published GHCR images instead of building.
+#
+# Layer this on top of compose.yaml; it only overrides each service's `image:`
+# (and pins `pull_policy: always`), so the hardening, secrets, volumes and
+# wiring in compose.yaml still apply:
+#
+#   docker compose -f compose.yaml -f compose.images.yaml pull
+#   docker compose -f compose.yaml -f compose.images.yaml up -d
+#
+# The images are built and pushed by .github/workflows/images.yml. Compose
+# follows `pull_policy` when a service has both `build` and `image`, so
+# `always` pulls the published image rather than building the local context.
+#
+# Pick a tag with ISIDORE_IMAGE_TAG (default: latest; CI also pushes `main`,
+# `sha-<short>` and, for `v*` tags, the semver tags) or a different registry
+# with ISIDORE_IMAGE_REGISTRY:
+#
+#   ISIDORE_IMAGE_TAG=v1.2.3 docker compose -f compose.yaml -f compose.images.yaml up -d
+services:
+  browser:
+    image: ${ISIDORE_IMAGE_REGISTRY:-ghcr.io/flo-dhalluin}/isidore-browser:${ISIDORE_IMAGE_TAG:-latest}
+    pull_policy: always
+
+  isidore:
+    image: ${ISIDORE_IMAGE_REGISTRY:-ghcr.io/flo-dhalluin}/isidore:${ISIDORE_IMAGE_TAG:-latest}
+    pull_policy: always
+
+  scheduler:
+    image: ${ISIDORE_IMAGE_REGISTRY:-ghcr.io/flo-dhalluin}/isidore-scheduler:${ISIDORE_IMAGE_TAG:-latest}
+    pull_policy: always

@@ -1,0 +1,99 @@
+name: images
+
+# Build the three service images and publish them to the GitHub Container
+# Registry. The published images are consumed by compose.images.yaml (see the
+# "Prebuilt images" section in README.md).
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    # Only rebuild when something that ends up in an image changed.
+    paths:
+      - "browser-tool/**"
+      - "isidore/**"
+      - "scheduler/**"
+      - "compose.yaml"
+      - "compose.images.yaml"
+      - ".github/workflows/images.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.service }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: browser
+            context: browser-tool
+            image: isidore-browser
+          - service: isidore
+            context: isidore
+            image: isidore
+            # The isidore Dockerfile reads the Pi SDK version from
+            # isidore/package-lock.json, so there is no version build arg here.
+            # ISIDORE_SOURCE bakes the source stamp into the io.isidore.source
+            # label (verified by launch.sh); use the commit SHA so a running
+            # image is traceable.
+            build_args: |
+              PI_WEB_PACKAGE=pi-web-access
+              ISIDORE_SOURCE=${{ github.sha }}
+          - service: scheduler
+            context: scheduler
+            image: isidore-scheduler
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # PRs build only (no push), so they need no registry credentials.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR requires a lowercase repository path; github.repository_owner
+      # preserves the account's casing.
+      - name: Image reference
+        id: image
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: echo "ref=ghcr.io/${OWNER,,}/${{ matrix.image }}" >> "$GITHUB_OUTPUT"
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.ref }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ matrix.build_args }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
