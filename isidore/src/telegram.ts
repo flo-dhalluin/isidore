@@ -242,6 +242,8 @@ export class TelegramBot {
   /** Telegram file_id of the logo, so it is uploaded only once per process. */
   private logoFileId: string | null = null;
   private readonly albums = new Map<string, AlbumBuffer>();
+  /** Chats that issued /new without a prompt and will start a fresh thread on the next message. */
+  private readonly newConversation = new Set<string>();
   private offset = 0;
   private stopped = false;
 
@@ -445,15 +447,16 @@ export class TelegramBot {
     const text = String(message.text ?? "").trim();
     if (!text) return;
 
-    const [rawCommand, ...restParts] = text.split(" ");
-    const command = rawCommand.split("@")[0].toLowerCase();
-    const rest = restParts.join(" ").trim();
+    const cmdMatch = text.startsWith("/") ? /^(\/[^\s@]+)(?:@[^\s]+)?(?:\s+([\s\S]*))?$/.exec(text) : null;
+    const command = cmdMatch ? cmdMatch[1].toLowerCase() : "";
+    const rest = cmdMatch ? (cmdMatch[2] ?? "").trim() : "";
 
-    // A reply to one of this bot's task messages continues that conversation.
+    // A reply to one of this bot's task messages continues that specific thread.
     const replyTo = (message.reply_to_message ?? null) as Record<string, unknown> | null;
-    if (replyTo && !command.startsWith("/")) {
+    if (replyTo && !command) {
       const task = this.resolveReplyTask(replyTo);
       if (task) {
+        this.newConversation.delete(chatId);
         await this.followup(chatId, task, text);
         return;
       }
@@ -464,15 +467,27 @@ export class TelegramBot {
       if (!(await this.sendLogo(chatId, formatHtml(this.help())))) await this.send(chatId, this.help());
     } else if (command === "/help") await this.send(chatId, this.help());
     else if (command === "/new") {
-      if (!rest) await this.send(chatId, "Usage: /new <prompt>");
-      else await this.create(chatId, rest);
+      if (!rest) {
+        this.newConversation.add(chatId);
+        await this.send(chatId, "Started a new conversation. Send your next message.");
+      } else {
+        this.newConversation.delete(chatId);
+        await this.create(chatId, rest);
+      }
     } else if (command === "/list") await this.list(chatId);
     else if (command === "/status") await this.status(chatId, rest);
     else if (command === "/cancel") await this.cancel(chatId, rest);
     else if (command === "/tools") await this.tools(chatId);
     else if (command === "/approve") await this.approve(chatId, rest);
-    else if (command.startsWith("/")) await this.send(chatId, `Unknown command ${command}. Try /help.`);
-    else await this.create(chatId, text);
+    else if (command) await this.send(chatId, `Unknown command ${command}. Try /help.`);
+    else if (this.newConversation.has(chatId)) {
+      this.newConversation.delete(chatId);
+      await this.create(chatId, text);
+    } else {
+      const latest = this.latestChatTask(chatId);
+      if (latest) await this.followup(chatId, latest, text);
+      else await this.create(chatId, text);
+    }
   }
 
   private resolveReplyTask(replyTo: Record<string, unknown> | null): Task | null {
@@ -481,6 +496,15 @@ export class TelegramBot {
     const replyText = String(replyTo.text ?? replyTo.caption ?? "");
     const taskId = replyText.match(TASK_ID)?.[0];
     return taskId && String(from.id ?? "") === this.botId ? (this.store.get(taskId) ?? null) : null;
+  }
+
+  private latestChatTask(chatId: string): Task | null {
+    const origin = `telegram:${chatId}`;
+    const limit = typeof this.store.count === "function" ? Math.max(this.store.count(), 100) : 100;
+    for (const task of this.store.list(limit)) {
+      if (task.origin === origin && !task.schedule_id) return task;
+    }
+    return null;
   }
 
   private extractImageItem(message: Record<string, unknown>): ImageItem | { tooLarge: true } | null {
@@ -624,17 +648,22 @@ export class TelegramBot {
       return;
     }
 
-    const replyTask = this.resolveReplyTask(replyTo);
+    const cmdMatch = caption.startsWith("/") ? /^(\/[^\s@]+)(?:@[^\s]+)?(?:\s+([\s\S]*))?$/.exec(caption) : null;
+    const isNewCommand = cmdMatch?.[1].toLowerCase() === "/new";
+    const prompt = (isNewCommand ? (cmdMatch?.[2] ?? "").trim() : caption) || "Describe the attached image(s).";
+
+    const replyTask = isNewCommand ? null : this.resolveReplyTask(replyTo);
+    const targetTask = replyTask ?? (isNewCommand || this.newConversation.has(chatId) ? null : this.latestChatTask(chatId));
     let parent: Task | null = null;
-    if (replyTask) {
-      const root = rootId(replyTask);
+    if (targetTask) {
+      const root = rootId(targetTask);
       const turns = this.store.thread(root);
       const running = turns.find((turn) => !isDone(turn));
       if (running) {
         await this.send(chatId, `${running.id} is still running; wait for it or /cancel ${running.id}.`);
         return;
       }
-      parent = turns[turns.length - 1] ?? replyTask;
+      parent = turns[turns.length - 1] ?? targetTask;
     }
 
     const effectiveModel = parent?.model ?? this.defaultModel;
@@ -669,7 +698,6 @@ export class TelegramBot {
       return;
     }
 
-    const prompt = caption || "Describe the attached image(s).";
     if (parent) {
       const root = rootId(parent);
       const turns = this.store.thread(root);
@@ -679,6 +707,7 @@ export class TelegramBot {
         await this.send(chatId, `${running.id} is still running; wait for it or /cancel ${running.id}.`);
         return;
       }
+      this.newConversation.delete(chatId);
       const existing = turns.flatMap((t) => (Array.isArray(t.uploads) ? t.uploads : []));
       const uploads = adoptUploads(this.uploadsRoot, root, stagedIds, existing);
       const next = this.runner.create(prompt, {
@@ -695,6 +724,7 @@ export class TelegramBot {
       return;
     }
 
+    this.newConversation.delete(chatId);
     const taskId = newId();
     const uploads = adoptUploads(this.uploadsRoot, taskId, stagedIds);
     const task = this.runner.create(prompt, {
@@ -838,8 +868,8 @@ export class TelegramBot {
     return [
       "isidore - spawn isolated Pi tasks",
       "",
-      "/new <prompt>   create a task (plain text also works)",
-      "reply to a task message to continue that conversation",
+      "/new [prompt]   start a new conversation",
+      "messages continue the current conversation (reply to a task message to switch threads)",
       "/list           recent tasks",
       "/status <id>    task details and output",
       "/cancel <id>    cancel a task",
