@@ -89,8 +89,8 @@ carries no parent task id.
   - `pi.registerTool()` works after startup, and the new tool is live in the
     same session (`docs/extensions.md` §registerTool).
   - `refreshTools`, `setActiveTools` and the `mcp_servers_change` event exist.
-  - Re-check all of these against the version pinned in `package-lock.json`,
-    because `PI_VERSION` defaults to `latest`.
+  - Re-check all of these against the version pinned in `package-lock.json`
+    (the image builds the Pi SDK from that lockfile).
 
 ## Phase 0: per-task isolation
 
