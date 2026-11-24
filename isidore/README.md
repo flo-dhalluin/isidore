@@ -293,7 +293,8 @@ which a reverse proxy must expose at that public HTTPS URL. That route is
 authenticated by Telegram's `X-Telegram-Bot-Api-Secret-Token` header, not by
 `ISIDORE_TOKEN`; the secret defaults to an HMAC of the bot token
 (override with `ISIDORE_TELEGRAM_WEBHOOK_SECRET[_FILE]`). An empty allow-list denies
-everyone. Commands: `/new <prompt>` (plain text also works), `/list`,
+everyone. Commands: `/new [prompt]` (start a new conversation; plain text
+continues the current conversation), `/list`,
 `/status <id>`, `/cancel <id>`, `/tools`, `/approve <id>`, `/help`; `/start`
 sends the bot logo with the help text. The
 originating chat is notified once

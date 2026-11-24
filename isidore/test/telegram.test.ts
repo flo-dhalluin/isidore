@@ -210,10 +210,69 @@ test("a reply to a task message becomes a follow-up of its conversation", async 
     await until(() => api.calls.some((c) => c.method === "sendMessage" && /still running/.test(c.body.text)));
     assert.equal(store.list(10).length, 3);
 
-    // A reply to someone else's message is a new task.
-    bot.handleWebhook(secret, message("fresh", { fromId: 999, text: `${first.id}` }));
+    // /new <prompt> starts a new conversation even while another turn is running.
+    bot.handleWebhook(secret, message("/new fresh", { fromId: 999, text: `${first.id}` }));
     await until(() => store.list(10).some((task) => task.prompt === "fresh"));
     assert.equal(store.list(10).find((task) => task.prompt === "fresh")!.thread_id, null);
+  });
+});
+
+test("plain messages continue the current conversation unless /new is issued", async () => {
+  await withBot(async ({ bot, store, api, secret }) => {
+    const sent = () => api.calls.filter((c) => c.method === "sendMessage");
+
+    // 1. First plain message in an empty chat starts a new conversation.
+    bot.handleWebhook(secret, message("hello"));
+    await until(() => store.list(10).length === 1);
+    const t1 = store.list(10).find((t) => t.prompt === "hello")!;
+    assert.equal(t1.thread_id, null);
+    assert.equal(t1.parent_id, null);
+    finish(store, t1, "hi there");
+
+    // A scheduled task in the same chat does not hijack the user's conversation.
+    const sched = finish(store, createTask("cron", { origin: "telegram:42", schedule_id: "s_1" }), "cron out");
+
+    // 2. Second plain message (no reply_to_message) is a follow-up of t1, not sched.
+    bot.handleWebhook(secret, message("how are you?"));
+    await until(() => store.list(10).some((t) => t.prompt === "how are you?"));
+    const t2 = store.list(10).find((t) => t.prompt === "how are you?")!;
+    assert.equal(t2.thread_id, t1.id);
+    assert.equal(t2.parent_id, t1.id);
+    assert.notEqual(t2.parent_id, sched.id);
+    finish(store, t2, "good");
+
+    // 3. Third plain message continues the same thread after t2.
+    bot.handleWebhook(secret, message("great"));
+    await until(() => store.list(10).some((t) => t.prompt === "great"));
+    const t3 = store.list(10).find((t) => t.prompt === "great")!;
+    assert.equal(t3.thread_id, t1.id);
+    assert.equal(t3.parent_id, t2.id);
+    finish(store, t3, "yep");
+
+    // 4. /new without a prompt resets the conversation; the next message starts fresh.
+    bot.handleWebhook(secret, message("/new"));
+    await until(() => sent().some((c) => /Started a new conversation/.test(c.body.text)));
+    bot.handleWebhook(secret, message("topic two"));
+    await until(() => store.list(10).some((t) => t.prompt === "topic two"));
+    const t4 = store.list(10).find((t) => t.prompt === "topic two")!;
+    assert.equal(t4.thread_id, null);
+    assert.equal(t4.parent_id, null);
+    finish(store, t4, "ok");
+
+    // 5. Next plain message follows up on topic two.
+    bot.handleWebhook(secret, message("more on topic two"));
+    await until(() => store.list(10).some((t) => t.prompt === "more on topic two"));
+    const t5 = store.list(10).find((t) => t.prompt === "more on topic two")!;
+    assert.equal(t5.thread_id, t4.id);
+    assert.equal(t5.parent_id, t4.id);
+    finish(store, t5, "done");
+
+    // 6. /new <prompt> immediately starts another new conversation.
+    bot.handleWebhook(secret, message("/new topic three"));
+    await until(() => store.list(10).some((t) => t.prompt === "topic three"));
+    const t6 = store.list(10).find((t) => t.prompt === "topic three")!;
+    assert.equal(t6.thread_id, null);
+    assert.equal(t6.parent_id, null);
   });
 });
 
@@ -504,6 +563,35 @@ test("Telegram handles photo, image document, and photo reply follow-ups", async
     assert.ok(existsSync(uploadPath(uploadsRoot, task1.id, follow.uploads[0].id)));
     await until(() => sent().length === 2);
     assert.match(sent()[1].body.text, /follow-up of/);
+
+    // 3. Photo without reply_to_message also continues the current conversation.
+    finish(store, follow, "looks good");
+    bot.handleWebhook(secret, {
+      update_id: updateId++,
+      message: {
+        chat: { id: 42 },
+        caption: "another angle",
+        photo: [{ file_id: "small", width: 100, height: 100, file_size: 100 }],
+      },
+    });
+    await until(() => store.list(10).length === 3);
+    const follow2 = store.list(10).find((t) => t.prompt === "another angle")!;
+    assert.equal(follow2.thread_id, task1.id);
+    assert.equal(follow2.parent_id, follow.id);
+
+    // 4. Photo with /new caption starts a new conversation even while follow2 is queued.
+    bot.handleWebhook(secret, {
+      update_id: updateId++,
+      message: {
+        chat: { id: 42 },
+        caption: "/new fresh photo",
+        photo: [{ file_id: "small", width: 100, height: 100, file_size: 100 }],
+      },
+    });
+    await until(() => store.list(10).length === 4);
+    const freshPhoto = store.list(10).find((t) => t.prompt === "fresh photo")!;
+    assert.equal(freshPhoto.thread_id, null);
+    assert.equal(freshPhoto.parent_id, null);
   });
 });
 

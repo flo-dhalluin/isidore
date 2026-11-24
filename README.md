@@ -166,7 +166,8 @@ no public URL or open port. A [webhook](#webhook-optional) is optional.
    then `docker compose up -d` to recreate the container.
    `curl localhost:8920/api/info` (plus `-H "Authorization: Bearer $ISIDORE_TOKEN"`
    if set) should report `"telegram": true, "telegram_mode": "polling"`.
-4. **Use it**: send plain text or `/new <prompt>` to queue a task; `/start`
+4. **Use it**: send plain text to continue the current conversation (or start
+   one if none exists yet), or `/new [prompt]` to start a fresh conversation; `/start`
    replies with the bot logo; `/list`,
    `/status <id>`, `/cancel <id>`, `/tools`, `/approve <id>`, `/help`. Send a
    photo, image document, or album (up to 4 images, ≤8 MiB each, with optional
@@ -174,7 +175,7 @@ no public URL or open port. A [webhook](#webhook-optional) is optional.
    originating chat gets the task's
    output when it finishes (split into several messages if long).
    **Reply** to any of the bot's task messages (with text or a photo) to
-   continue that conversation:
+   continue that specific conversation:
    the reply becomes the next turn of the thread, with the same workspace and
    Pi session (refused while a turn of it is still running).
    Schedules the agent creates from a Telegram task (`schedule_task`) post
