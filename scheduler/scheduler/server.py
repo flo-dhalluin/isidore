@@ -121,10 +121,15 @@ MUTATING = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldH
 ORIGIN_HEADER = "x-isidore-origin"
 
 
+def _telegram_reply_to(origin: str | None) -> str | None:
+    """Only Telegram origins are valid reply targets for spawned tasks."""
+    value = str(origin or "").strip()
+    return value if value.startswith("telegram:") else None
+
+
 def _reply_to(ctx: Context | None) -> str | None:
     headers = ctx.headers if ctx is not None else None
-    origin = (headers or {}).get(ORIGIN_HEADER, "").strip()
-    return origin if origin.startswith("telegram:") else None
+    return _telegram_reply_to((headers or {}).get(ORIGIN_HEADER, ""))
 
 
 def _is_admin(ctx: Context | None) -> bool:
@@ -304,6 +309,9 @@ async def api_schedules(request: Request) -> Response:
             every=body.get("every") or None,
             model=body.get("model") or None,
             origin=str(body.get("origin") or "isidore"),
+            # REST-created schedules route results back to the caller's origin
+            # (e.g. a Telegram chat) exactly like the MCP schedule_task path.
+            reply_to=_telegram_reply_to(body.get("reply_to")),
             conversation_id=conversation_id,
         )
     except ValueError as exc:

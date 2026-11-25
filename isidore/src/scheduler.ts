@@ -74,13 +74,23 @@ export class SchedulerClient {
 
   async create(
     prompt: string,
-    options: { at?: string | null; every?: string | number | null; model?: string | null; origin?: string } = {},
+    options: {
+      at?: string | null;
+      every?: string | number | null;
+      model?: string | null;
+      origin?: string;
+      reply_to?: string | null;
+    } = {},
     conversationId?: string | null,
   ): Promise<Record<string, unknown>> {
     const payload: Record<string, unknown> = { prompt, origin: options.origin ?? "isidore" };
     if (options.at) payload.at = options.at;
     if (options.every) payload.every = options.every;
     if (options.model) payload.model = options.model;
+    // Where the spawned task's results go back to (e.g. "telegram:<chat>").
+    // Mirrors the MCP schedule_task reply_to so REST-created schedules route
+    // their results the same way; the scheduler only honors telegram: values.
+    if (options.reply_to) payload.reply_to = options.reply_to;
     return (await this.request("POST", "/api/schedules", payload, conversationId)) as Record<string, unknown>;
   }
 

@@ -450,6 +450,43 @@ test("schedules proxy sends the conversation header for task tokens only", async
   }
 });
 
+test("schedules proxy forwards a telegram task's origin as reply_to", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "isidore-server-"));
+  const settings = settingsFor(dir);
+  settings.schedulerUrl = "http://scheduler.test";
+  settings.schedulerToken = "sched-admin";
+  const { app, tokens } = await createApp(settings);
+
+  const bodies: Record<string, unknown>[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (_url: any, init: any = {}) => {
+    if ((init.method ?? "GET") === "POST") bodies.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({ id: "s_new", prompt: "p" }), { status: 201, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+
+  try {
+    // A Telegram-originated task, as the bot creates them.
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/tasks",
+      headers: adminAuth,
+      payload: { prompt: "tg", origin: "telegram:42" },
+    });
+    const tgTask = await waitForTerminal(app, created.json().id);
+    const tgToken = tokens.issue(tgTask);
+    await app.inject({ method: "POST", url: "/api/schedules", headers: bearer(tgToken), payload: { prompt: "p", at: "+1h" } });
+    assert.equal(bodies[0].reply_to, "telegram:42");
+
+    // A plain admin request has no task origin, so no reply_to is forwarded.
+    await app.inject({ method: "POST", url: "/api/schedules", headers: adminAuth, payload: { prompt: "p", at: "+1h" } });
+    assert.equal(bodies[1].reply_to, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await app.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("schedules proxy reads the scheduler token file when no env token is set", async () => {
   const dir = mkdtempSync(join(tmpdir(), "isidore-server-"));
   const settings = settingsFor(dir);
