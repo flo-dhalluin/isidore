@@ -76,3 +76,23 @@ test("no token and no file: requests go out unauthenticated (scheduler decides)"
     stub.restore();
   }
 });
+
+test("create forwards reply_to only when set", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (_url: any, init: any = {}) => {
+    bodies.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({ id: "s_1" }), { status: 201, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+  try {
+    const client = new SchedulerClient("http://scheduler.test", "tok");
+    await client.create("p", { at: "+1h", reply_to: "telegram:42" });
+    await client.create("q", { at: "+1h" });
+    await client.create("r", { at: "+1h", reply_to: null });
+    assert.equal(bodies[0].reply_to, "telegram:42");
+    assert.equal(bodies[1].reply_to, undefined);
+    assert.equal(bodies[2].reply_to, undefined);
+  } finally {
+    globalThis.fetch = original;
+  }
+});

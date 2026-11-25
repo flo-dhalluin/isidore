@@ -385,6 +385,35 @@ class RestScopingTest(unittest.TestCase):
         self.assertEqual(self.client.post(f"/api/schedules/{sid}/run", headers=self.admin).status_code, 200)
         self.assertEqual(self.client.delete(f"/api/schedules/{sid}", headers=self.admin).status_code, 204)
 
+    def test_reply_to_routes_results_back_to_telegram(self):
+        # A REST-created schedule with a telegram reply_to spawns a child whose
+        # origin is that chat, so its results are posted back to Telegram.
+        response = self.client.post(
+            "/api/schedules",
+            json={"prompt": "p", "at": "+1h", "reply_to": "telegram:42"},
+            headers=self.admin,
+        )
+        self.assertEqual(response.status_code, 201)
+        schedule = response.json()
+        self.assertEqual(schedule["reply_to"], "telegram:42")
+        fired = self.client.post(f"/api/schedules/{schedule['id']}/run", headers=self.admin)
+        self.assertEqual(fired.status_code, 200)
+        _, kwargs = self.scheduler.spawner.calls[0]
+        self.assertEqual(kwargs["origin"], "telegram:42")
+
+    def test_reply_to_only_telegram(self):
+        # Non-telegram origins are not valid reply targets; they are dropped.
+        for value in ("web", "scheduler", "", None):
+            response = self.client.post(
+                "/api/schedules",
+                json={"prompt": "p", "at": "+1h", "reply_to": value},
+                headers=self.admin,
+            )
+            self.assertEqual(response.status_code, 201)
+            self.assertIsNone(response.json()["reply_to"])
+        # An absent reply_to also stays None (legacy behavior).
+        self.assertIsNone(self._create("p")["reply_to"])
+
 
 class AdminTokenBootstrapTest(unittest.TestCase):
     """ensure_admin_token: fail-closed generation, 0600 file, dev fallbacks."""

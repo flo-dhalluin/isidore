@@ -554,6 +554,11 @@ export async function createApp(
       return reply.code(400).send({ error: `model not allowed: ${model}` });
     }
     const conversationId = auth.kind === "task" ? auth.scope.rootId : null;
+    // A task-created schedule reports its results back to the task's origin
+    // (e.g. a Telegram chat), just like the MCP schedule_task path. The origin
+    // comes from the validated task scope, never the request body; the
+    // scheduler only honors telegram: values.
+    const replyTo = auth.kind === "task" ? auth.scope.origin : null;
     try {
       const schedule = await scheduler.create(
         prompt,
@@ -561,6 +566,7 @@ export async function createApp(
           at: body.at ? String(body.at) : null,
           every: (body.every as string | number | undefined) ?? null,
           model,
+          reply_to: replyTo,
         },
         conversationId,
       );
